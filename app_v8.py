@@ -6,20 +6,23 @@ from math import log, sqrt, exp
 from datetime import datetime, date, timedelta
 from typing import Optional, Tuple, List, Dict
 
+import asyncio
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
 import matplotlib.pyplot as plt
+from bs4 import BeautifulSoup
+from requests_html import HTMLSession
 
 # ============================================================
 # Config e título
 # ============================================================
 
-st.set_page_config(page_title="Strangle Vendido Coberto – v8 (Saídas & Didático)", layout="wide")
+st.set_page_config(page_title="Strangle Vendido Coberto – v8 (JS render fix)", layout="wide")
 st.title("💼 Strangle Vendido Coberto – Sugeridor (v8)")
-st.caption("Saídas automáticas • Instruções operacionais • Ranking prêmio/risco • PoE combinada • Resumo por ticker • Top 3 • Options.net • Catálogo B3")
+st.caption("Agora com coleta robusta no opções.net (renderização JS), além de: Saídas automáticas • Ranking prêmio/risco • PoE combinada • Resumo • Top 3 • Catálogo B3")
 
 # ============================================================
 # Utils / Black–Scholes
@@ -68,6 +71,19 @@ def prob_ITM_put(S, K, r, sigma, T):
 # Helpers para Options.net e normalização
 # ============================================================
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
+
+CALL_SERIES = set(list("ABCDEFGHIJKL"))
+PUT_SERIES  = set(list("MNOPQRSTUVWX"))
+
 def base_ticker_for_optionsnet(ticker: str) -> str:
     """ 'PETR4.SA' -> 'PETR4' ; remove sufixos/espaços; uppercase """
     txt = (ticker or "").strip().upper()
@@ -78,6 +94,15 @@ def base_ticker_for_optionsnet(ticker: str) -> str:
 def optionsnet_url_from_ticker(ticker: str) -> str:
     return f"https://opcoes.net.br/opcoes/bovespa/{base_ticker_for_optionsnet(ticker)}"
 
+def _br_to_float(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)): return np.nan
+    s = str(x).strip()
+    if s in ('', 'nan', '-', '—'): return np.nan
+    s = s.replace('.', '').replace(',', '.')
+    s = re.sub(r'[^0-9.\-eE]', '', s)
+    try: return float(s)
+    except: return np.nan
+
 def try_read_csv_text(text: str) -> Optional[pd.DataFrame]:
     try:
         return pd.read_csv(io.StringIO(text))
@@ -85,15 +110,16 @@ def try_read_csv_text(text: str) -> Optional[pd.DataFrame]:
         return None
 
 def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # 1) mapear nomes comuns (PT/EN) -> canônicos
     colmap = {
-        'symbol': ['symbol','símbolo','ticker','codigo','código','asset'],
-        'expiration': ['expiration','vencimento','expiração','expiracao','expiry','expiration_date'],
-        'type': ['type','tipo','opção','opcao','option_type'],
+        'symbol': ['symbol','símbolo','ticker','codigo','código','asset','codigo da opcao','código da opção','codigo da opção'],
+        'expiration': ['expiration','venc','vencimento','expiração','expiracao','expiry','expiration_date','venc.','vencimento (d/m/a)'],
+        'type': ['type','tipo','opção','opcao','option_type','class'],
         'strike': ['strike','preço de exercício','preco de exercicio','exercicio','k','strike_price'],
         'bid': ['bid','compra','melhor compra','oferta de compra'],
         'ask': ['ask','venda','melhor venda','oferta de venda'],
-        'last': ['last','último','ultimo','preço','preco','close','último negócio'],
-        'impliedVol': ['iv','ivol','impliedvol','implied_vol','vol implícita','vol implicita'],
+        'last': ['last','último','ultimo','preço','preco','close','último negócio','ultimo negocio','último neg.','ult.'],
+        'impliedVol': ['iv','ivol','impliedvol','implied_vol','vol implícita','vol implicita','vol. impl. (%)','vol impl (%)'],
         'delta': ['delta','Δ']
     }
     rename = {}
@@ -105,119 +131,136 @@ def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
                 break
     df = df.rename(columns=rename)
 
-    # colunas mínimas
-    for c in ["symbol","expiration","type","strike","bid","ask"]:
+    # 2) se faltar TIPO, inferir pela letra da série no código da opção
+    if 'type' not in df.columns and 'symbol' in df.columns:
+        def infer_type(code: str):
+            if not isinstance(code, str): return np.nan
+            s = re.sub(r'[^A-Z0-9]', '', code.upper().strip())
+            m = re.search(r'([A-Z])\d+$', s)
+            if not m: return np.nan
+            letra = m.group(1)
+            if letra in CALL_SERIES: return 'C'
+            if letra in PUT_SERIES:  return 'P'
+            return np.nan
+        df['type'] = df['symbol'].map(infer_type)
+
+    # 3) coerções e formatos
+    for c in ["strike","bid","ask","last","impliedVol","delta"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c].map(_br_to_float), errors="coerce")
+
+    # expiration vira date
+    if "expiration" in df.columns:
+        # tentar ler como dd/mm/aaaa ou aaaa-mm-dd
+        def _parse_date(x):
+            if pd.isna(x): return np.nan
+            s = str(x).strip()
+            for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                try:
+                    return datetime.strptime(s, fmt).date()
+                except Exception:
+                    continue
+            # se vier timestamp/Excel-like
+            try:
+                return pd.to_datetime(x, dayfirst=True).date()
+            except Exception:
+                return np.nan
+        df["expiration"] = df["expiration"].map(_parse_date)
+
+    # garante colunas mínimas
+    for c in ["symbol","expiration","type","strike"]:
         if c not in df.columns:
             df[c] = np.nan
 
-    # formatos
+    # padroniza type
     df["type"] = df["type"].astype(str).str.upper().str.strip().replace({
         'CALL':'C','C':'C','COMPRA':'C','CALLS':'C',
         'PUT':'P','P':'P','VENDA':'P','PUTS':'P'
     })
-    df["expiration"] = pd.to_datetime(df["expiration"], errors="coerce").dt.date
-    for c in ["strike","bid","ask","last","impliedVol","delta"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return df.dropna(subset=["expiration","type","strike"], how="any")
+    # se não houver bid/ask, manteremos apenas 'last' como proxy
+    return df.dropna(subset=["symbol","type","strike"], how="any")
 
-# ===== NOVO: Headers de navegador + seletor de tabela e rota alternativa =====
+def _flatten_columns(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join([str(p).strip() for p in tpl if str(p).strip() not in ('','nan','None')]) for tpl in df.columns]
+    else:
+        df.columns = [str(c).strip() for c in df.columns]
+    # dedup
+    seen, cols = {}, []
+    for c in df.columns:
+        if c not in seen:
+            seen[c]=0; cols.append(c)
+        else:
+            seen[c]+=1; cols.append(f"{c}_{seen[c]}")
+    df.columns = cols
+    return df
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    "Cache-Control": "no-cache",
-}
-
-def choose_options_table(tables: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    """
-    Escolhe a melhor tabela candidata à chain de opções.
-    Critérios: contém colunas típicas e tem bastante conteúdo numérico.
-    """
-    if not tables:
+def _choose_table_from_html(html_text: str) -> Optional[pd.DataFrame]:
+    """Procura a maior tabela com tbody contendo linhas > 0."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    best_tbl, best_rows = None, -1
+    for tbl in soup.find_all("table"):
+        tbody = tbl.find("tbody")
+        nrows = len(tbody.find_all("tr")) if tbody else max(len(tbl.find_all("tr"))-1, 0)
+        if nrows > best_rows:
+            best_rows, best_tbl = nrows, tbl
+    if not best_tbl or best_rows <= 0:
         return None
-
-    candidates = [
-        "strike", "preço de exercício", "preco de exercicio", "exercicio",
-        "bid", "compra", "melhor compra",
-        "ask", "venda", "melhor venda",
-        "expiration", "vencimento",
-        "type", "tipo"
-    ]
-
-    def score_table(df: pd.DataFrame) -> tuple[int, int, int]:
-        cols = [str(c).lower() for c in df.columns]
-        hits = sum(any(key in c for c in cols) for key in candidates)
-        # células numéricas
-        try:
-            num_cells = int(df.apply(pd.to_numeric, errors="coerce").notna().sum().sum())
-        except Exception:
-            num_cells = 0
-        size = df.shape[0] * df.shape[1]
-        return (hits, num_cells, size)
-
-    best = None
-    best_score = (-1, -1, -1)
-    for t in tables:
-        sc = score_table(t)
-        if sc > best_score:
-            best_score = sc
-            best = t
-    return best
+    # Tenta header simples, depois multinível
+    table_html = str(best_tbl)
+    try:
+        df = pd.read_html(io.StringIO(table_html), flavor="bs4", thousands=".", decimal=",", header=0)[0]
+        if df.shape[0] == 0:
+            raise ValueError("sem linhas")
+    except Exception:
+        df = pd.read_html(io.StringIO(table_html), flavor="bs4", thousands=".", decimal=",", header=[0,1])[0]
+    return _flatten_columns(df)
 
 @st.cache_data(show_spinner=False)
-def fetch_optionsnet(url_primary: str) -> pd.DataFrame:
+def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
     """
-    Tenta a rota padrão e uma rota alternativa com headers reais.
-    Escolhe a melhor tabela encontrada e normaliza.
+    Usa requests-html (r.html.render) para executar JS da página,
+    então seleciona a maior tabela e normaliza colunas.
     """
-    sess = requests.Session()
+    # extrai ticker base a partir da URL recebida do app
+    ticker_base = ticker_url.rsplit("/", 1)[-1].strip().upper()
+    url = f"https://opcoes.net.br/opcoes/bovespa/{ticker_base}"
 
-    # Extrai ticker base da URL primária
+    # 1) HTML com renderização JS
+    sess = HTMLSession()
+    r = sess.get(url, headers=HEADERS, timeout=40)
+    # renderiza JS (pyppeteer) – pode demorar alguns segundos na 1ª vez
+    r.html.render(timeout=90, sleep=2)
+    df = _choose_table_from_html(r.html.html)
+    if df is not None and not df.empty:
+        return normalize_chain_columns(df)
+
+    # 2) Fallback: tentar a própria resposta sem render (casos simples)
     try:
-        ticker_base = url_primary.rsplit("/", 1)[-1].strip().upper()
+        tables = pd.read_html(r.text)
+        if tables:
+            df2 = _flatten_columns(max(tables, key=lambda t: t.shape[0]*t.shape[1]))
+            df2 = normalize_chain_columns(df2)
+            if not df2.empty:
+                return df2
     except Exception:
-        ticker_base = ""
+        pass
 
-    urls = [
-        url_primary,  # /opcoes/bovespa/{TICKER}
-        f"https://opcoes.net.br/opcoes2/bovespa?ativo={ticker_base}",  # rota alternativa
-    ]
+    # 3) Rota alternativa simples (pode ajudar em alguns dias)
+    alt = f"https://opcoes.net.br/opcoes2/bovespa?ativo={ticker_base}"
+    rr = requests.get(alt, headers=HEADERS, timeout=40)
+    try:
+        tables = pd.read_html(rr.text)
+        if tables:
+            df3 = _flatten_columns(max(tables, key=lambda t: t.shape[0]*t.shape[1]))
+            df3 = normalize_chain_columns(df3)
+            if not df3.empty:
+                return df3
+    except Exception:
+        pass
 
-    last_err = None
-    for url in urls:
-        try:
-            # 1) tentativa CSV
-            r = sess.get(url, headers=HEADERS, timeout=25)
-            r.raise_for_status()
-
-            df_csv = try_read_csv_text(r.text)
-            if df_csv is not None and len(df_csv) > 0:
-                df_norm = normalize_chain_columns(df_csv)
-                if not df_norm.empty:
-                    return df_norm
-
-            # 2) tentativa HTML (uma ou mais tabelas)
-            tables = pd.read_html(r.text)
-            if tables:
-                best = choose_options_table(tables)
-                if best is not None and not best.empty:
-                    df_norm = normalize_chain_columns(best)
-                    if not df_norm.empty:
-                        return df_norm
-
-        except Exception as e:
-            last_err = e
-            continue
-
-    if last_err:
-        raise RuntimeError(f"Nenhuma tabela encontrada (último erro: {type(last_err).__name__}: {last_err})")
-    raise RuntimeError("Nenhuma tabela encontrada nas rotas conhecidas.")
+    raise RuntimeError("Não foi possível obter a tabela de opções (após renderização JS e fallbacks).")
 
 # ============================================================
 # Yahoo/IV helpers
@@ -254,15 +297,11 @@ def compute_iv_rank_percentile(series_df: Optional[pd.DataFrame], lookback: int)
     return (iv_now, iv_rank, iv_percentile)
 
 # ============================================================
-# NOVO: baixar lista de tickers + nomes (dadosdemercado)
+# Lista de tickers + nomes (dadosdemercado)
 # ============================================================
 
 @st.cache_data(show_spinner=False)
 def fetch_b3_ticker_list() -> pd.DataFrame:
-    """
-    Lê https://www.dadosdemercado.com.br/acoes e retorna DataFrame com colunas:
-    ticker, name.
-    """
     url = "https://www.dadosdemercado.com.br/acoes"
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
@@ -390,7 +429,15 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         return None
 
     # mid e IV efetiva
-    chain["mid"] = (chain["bid"].fillna(0) + chain["ask"].fillna(0)) / 2.0
+    # Se bid/ask não existirem, usar 'last' como proxy do prêmio
+    if "bid" in chain.columns and "ask" in chain.columns and chain["bid"].notna().any() and chain["ask"].notna().any():
+        chain["mid"] = (chain["bid"].fillna(0) + chain["ask"].fillna(0)) / 2.0
+    else:
+        if "last" not in chain.columns:
+            st.error("Tabela sem bid/ask e sem 'last' — não há como estimar o prêmio.")
+            return None
+        chain["mid"] = chain["last"].fillna(0)
+
     if "impliedVol" not in chain.columns:
         chain["impliedVol"] = np.nan
     chain["iv_eff"] = chain["impliedVol"]
@@ -398,14 +445,14 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         chain["iv_eff"] = hv20
 
     # vencimentos
-    expirations = sorted(chain["expiration"].dropna().unique().tolist())
+    expirations = sorted([d for d in chain["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))], key=lambda x: x)
     if not expirations:
         st.error("Nenhum vencimento válido encontrado.")
         return None
 
     exp_choice = st.selectbox("Vencimento", options=expirations, key=f"exp_{tk}")
-    T = yearfrac(date.today(), exp_choice)
-    days_to_exp = (exp_choice - date.today()).days
+    T = yearfrac(date.today(), exp_choice if isinstance(exp_choice, date) else exp_choice.date())
+    days_to_exp = (exp_choice - date.today()).days if isinstance(exp_choice, date) else (exp_choice.date() - date.today()).days
     if np.isnan(spot) or spot <= 0 or T <= 0:
         st.error("Não foi possível calcular S ou T para este ticker.")
         return None
@@ -720,6 +767,10 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
 # ============================================================
 # MAIN – Abas por ticker + parâmetros específicos por ticker
 # ============================================================
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("**Requisitos extras para coleta JS:** `requests-html`, `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`")
 
 # Cria abas
 tabs = st.tabs(tickers)
