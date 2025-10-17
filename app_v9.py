@@ -1,13 +1,7 @@
 # app_v9_b3_file.py
 # v9 (1 ticker por vez) — robusto para planilhas do opcoes.net
-# - Busca tickers B3 (Dados de Mercado)
-# - Upload Excel/CSV com detecção automática de header (linha 2 OU 1)
-# - Vencimento por nome OU fallback na COLUNA B (dd/mm/aaaa)
-# - Normalização de 'type' (C/P) com múltiplas heurísticas + fallback por strike vs. spot (sem np.where)
-# - Cálculo de mid robusto, deltas por BS quando faltarem
-# - Sugestões de strangle vendido coberto + instruções de saída
-# - Aba 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)
-# Requisitos: streamlit, pandas, numpy, matplotlib, requests, beautifulsoup4, lxml, yfinance, openpyxl
+# Correção principal: _br_to_float não remove mais '.' de números já-decimais (24.50).
+# Se strike continuar NaN, tentamos pd.to_numeric direto no bruto como fallback.
 
 import io
 import re
@@ -72,13 +66,41 @@ def prob_ITM_put(S, K, r, sigma, T):
     return (1.0 - p_call) if not np.isnan(p_call) else np.nan
 
 def _br_to_float(x):
-    if x is None or (isinstance(x, float) and np.isnan(x)): return np.nan
+    """Converte string BR '1.234,56' ou string EN '1234.56' para float.
+       Se já for float/int, retorna direto. Remove NBSP e símbolos (R$, %)."""
+    if x is None:
+        return np.nan
+    # Se já for número (pandas muitas vezes traz como float/Int64)
+    if isinstance(x, (int, float, np.integer, np.floating)) and not pd.isna(x):
+        return float(x)
     s = str(x).strip()
-    if s in ('', 'nan', '-', '—'): return np.nan
-    s = s.replace('.', '').replace(',', '.')
-    s = re.sub(r'[^0-9.\-eE]', '', s)
-    try: return float(s)
-    except: return np.nan
+    if s == "" or s.lower() in ("nan", "-", "—"):
+        return np.nan
+    # normaliza espaços especiais
+    s = s.replace("\xa0", " ").replace("\u202f", " ")
+    # remove tudo que não seja dígito, ponto, vírgula, sinal ou expoente
+    s_clean = re.sub(r"[^0-9,.\-eE]", "", s)
+
+    # Se tem vírgula, assumimos padrão BR: '.' milhar, ',' decimal
+    if "," in s_clean:
+        s_clean = s_clean.replace(".", "")  # remove milhares
+        s_clean = s_clean.replace(",", ".") # decimal vira ponto
+        try:
+            return float(s_clean)
+        except:
+            return np.nan
+    else:
+        # Sem vírgula: pode estar como '1234.56' ou '123456'
+        # Não remova '.' aqui! É possivelmente o separador decimal.
+        try:
+            return float(s_clean)
+        except:
+            # último recurso: tira pontos múltiplos de milhares tipo '1.234.567'
+            s2 = s_clean.replace(".", "")
+            try:
+                return float(s2)
+            except:
+                return np.nan
 
 def _excel_serial_to_date(n):
     try:
@@ -304,10 +326,16 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
             return np.nan
         out["type"] = out["symbol"].map(infer_from_symbol)
 
-    # strike
+    # strike (com parser corrigido) + fallback to_numeric
     c_strike = find_col(aliases["strike"])
     if c_strike:
-        out["strike"] = pd.to_numeric(df[c_strike].map(_br_to_float), errors="coerce")
+        raw = df[c_strike]
+        # 1) tenta parser BR/EN robusto
+        strike_parsed = pd.to_numeric(raw.map(_br_to_float), errors="coerce")
+        # 2) se zerado, tenta um to_numeric direto como plano B
+        if strike_parsed.notna().sum() == 0:
+            strike_parsed = pd.to_numeric(raw, errors="coerce")
+        out["strike"] = strike_parsed
     else:
         out["strike"] = np.nan
 
@@ -368,10 +396,10 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
                 out["expiration"] = forced
             except Exception:
                 out["expiration"] = np.nan
-    if "impliedVol" not in out.columns: out["impliedVol"] = np.nan
-    if "type" not in out.columns: out["type"] = np.nan
-    if "strike" not in out.columns: out["strike"] = np.nan
-    if "expiration" not in out.columns: out["expiration"] = np.nan
+
+    # preenche faltantes
+    for c in ["impliedVol","type","strike","expiration"]:
+        if c not in out.columns: out[c] = np.nan
 
     # Diag
     with st.expander("🛠️ Diagnóstico de leitura"):
@@ -410,7 +438,7 @@ df = chain_all[chain_all["expiration"] == exp_choice].copy()
 # 🔧 GARANTIA: strike numérico
 df["strike"] = pd.to_numeric(df.get("strike", np.nan), errors="coerce")
 
-# ---- Completa 'type' por fallback strike vs. spot, se necessário (sem np.where) ----
+# ---- Completa 'type' por fallback strike vs. spot (sem np.where) ----
 if "type" not in df.columns or df["type"].isna().all():
     t_guess = pd.Series(None, index=df.index, dtype="object")
     gt = df["strike"] > float(spot)
@@ -501,9 +529,6 @@ def label_band(p):
 
 calls["band"] = calls["prob_ITM"].apply(label_band)
 puts["band"]  = puts["prob_ITM"].apply(label_band)
-# (Se quiser limitar pelas bandas selecionadas:)
-# calls = calls[calls["band"].isin(risk_selection)]
-# puts  = puts[puts["band"].isin(risk_selection)]
 
 # ---- Cobertura ----
 st.markdown("### 4) Cobertura e tamanho do contrato")
@@ -647,7 +672,7 @@ fig = plt.figure()
 plt.plot(S_grid, payoff)
 plt.axhline(0, linestyle="--"); plt.axvline(Kp, linestyle=":"); plt.axvline(Kc, linestyle=":")
 plt.title(f"{TICKER} — Payoff | Kp={Kp:.2f}, Kc={Kc:.2f}, Crédito≈R$ {credit:.2f}/ação")
-plt.xlabel("Preço no vencimento (S)"); plt.ylabel("P/L por ação (R$)")
+plt.xlabel("Preço do ativo no vencimento (S)"); plt.ylabel("P/L por ação (R$)")
 st.pyplot(fig, use_container_width=True)
 
 # ---- Comparar Estratégias ----
