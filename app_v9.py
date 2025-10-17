@@ -1,13 +1,12 @@
 # app_v9_paste_or_file.py
 # v9 — 1 ticker por vez | Importar planilha do opcoes.net OU Colar tabela do site
-# - Detecção automática de cabeçalho (linha 1/2) para arquivos
-# - Colar: tenta HTML (<table>), CSV/TSV (; , \t) ou texto tabular
-# - Mapeamento automático PT-BR de colunas (Ticker, Vencimento, Tipo, Strike, Último, IV, Delta)
-# - Sugestões de strangle coberto + comparador (Strangle × Iron Condor × Jade Lizard)
-# - Instruções didáticas de saída
+# Correções:
+#  - norm_cdf agora usa math.erf (antes: np.math.erf -> causava AttributeError)
+#  - Demais lógicas mantidas (upload/colar, mapeamento PT-BR, strangle + comparador)
 
 import io, re, unicodedata
 from datetime import date, datetime, timedelta
+import math  # <<< usamos math.erf
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -15,10 +14,8 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
 import requests
-
 from pandas.tseries.offsets import BDay
 
-# -------------------- Setup --------------------
 st.set_page_config(page_title="Strangle Vendido Coberto — v9", page_icon="💼", layout="wide")
 st.title("💼 Strangle Vendido Coberto — v9 (B3 + planilha OU colar tabela)")
 st.caption("Escolha um ticker, **faça upload** do Excel/CSV do opcoes.net **ou cole a tabela** copiada do site. Depois veja as sugestões e compare estratégias.")
@@ -37,8 +34,14 @@ def _norm_colname(c: str) -> str:
     c2 = _strip_accents(c1).lower()
     return c2
 
+# === FIX: usar math.erf ===
 def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + np.math.erf(x / SQRT_2))
+    """N(0,1) CDF"""
+    try:
+        return 0.5 * (1.0 + math.erf(x / SQRT_2))
+    except Exception:
+        # fallback super conservador (não deve acontecer)
+        return float("nan")
 
 def yearfrac(start: date, end: date) -> float:
     return max(1e-9, (end - start).days / 365.0)
@@ -72,7 +75,6 @@ def prob_ITM_put(S, K, r, sigma, T):
     return (1.0 - p_call) if not np.isnan(p_call) else np.nan
 
 def _br_to_float(x):
-    """Converte '1.234,56' ou '1234.56' em float. Mantém floats/ints. Remove NBSP/símbolos."""
     if x is None:
         return np.nan
     if isinstance(x, (int, float, np.integer, np.floating)) and not pd.isna(x):
@@ -83,8 +85,8 @@ def _br_to_float(x):
     s = s.replace("\xa0", " ").replace("\u202f", " ")
     s_clean = re.sub(r"[^0-9,.\-eE]", "", s)
     if "," in s_clean:
-        s_clean = s_clean.replace(".", "")     # milhares
-        s_clean = s_clean.replace(",", ".")    # decimal
+        s_clean = s_clean.replace(".", "")
+        s_clean = s_clean.replace(",", ".")
         try: return float(s_clean)
         except: return np.nan
     else:
@@ -121,7 +123,6 @@ def _parse_date_any(x):
     except Exception:
         return np.nan
 
-# -------------------- Fetch tickers (UX) --------------------
 @st.cache_data(ttl=6*60*60, show_spinner=False)
 def fetch_b3_tickers():
     url = "https://www.dadosdemercado.com.br/acoes"
@@ -176,7 +177,6 @@ with col_tk2:
 if not TICKER:
     st.stop()
 
-# -------------------- Sidebar params --------------------
 with st.sidebar:
     st.header("⚙️ Parâmetros")
     r = st.number_input("Taxa livre de risco anual (r)", 0.0, 1.0, 0.11, 0.005, format="%.3f",
@@ -200,7 +200,6 @@ with st.sidebar:
     capture_target = st.number_input("Meta de captura do prêmio (%)", 10, 95, 70,
                                      help="Encerrar com ganho parcial (ex.: 70% capturado).") / 100.0
 
-# -------------------- Spot/HV20 --------------------
 @st.cache_data(show_spinner=False)
 def load_spot_and_hv20(yahoo_ticker: str):
     try:
@@ -224,18 +223,13 @@ if np.isnan(spot) or spot <= 0:
     st.error("Não consegui obter o preço à vista. Verifique o ticker.")
     st.stop()
 
-# -------------------- Entrada: Upload ou Colar --------------------
 st.markdown(f"### 3) Entrada de dados para **{TICKER}**")
 mode = st.radio("Como quer fornecer a *option chain* do opcoes.net?",
                 ["📄 Upload de arquivo (.xlsx/.csv)", "📋 Colar tabela copiada do site"],
                 horizontal=True)
 
 def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Recebe um DataFrame cru (do arquivo OU da colagem) e devolve colunas padronizadas:
-       symbol (opcional), type (C/P), strike, mid, impliedVol, delta, expiration."""
-    # normaliza nomes
     rev_map = {_norm_colname(c): c for c in df.columns}
-
     aliases = {
         "symbol": ["ticker", "codigo", "código", "opcao", "opção", "simbolo", "símbolo"],
         "expiration": ["vencimento", "venc", "expiracao", "expiração", "expiry"],
@@ -248,7 +242,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
         "impliedVol": ["vol impl (%)", "vol impl. (%)", "volatilidade implicita", "volatilidade implícita", "iv", "iv (%)"],
         "delta": ["delta", "Δ"],
     }
-
     def find_col(alias_list):
         for al in alias_list:
             norm = _norm_colname(al)
@@ -261,12 +254,9 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
         return None
 
     out = pd.DataFrame(index=df.index)
-
-    # symbol
     c_symbol = find_col(aliases["symbol"])
     if c_symbol is not None: out["symbol"] = df[c_symbol]
 
-    # type
     c_type = find_col(aliases["type"])
     if c_type is not None:
         tnorm = df[c_type].astype(str).str.upper().str.strip()
@@ -274,7 +264,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["type"] = np.nan
 
-    # fallback do type via símbolo (letra da série)
     if out["type"].isna().all() and "symbol" in out.columns:
         def infer_from_symbol(code: str):
             if not isinstance(code, str): return np.nan
@@ -287,7 +276,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
             return np.nan
         out["type"] = out["symbol"].map(infer_from_symbol)
 
-    # strike
     c_strike = find_col(aliases["strike"])
     if c_strike:
         raw = df[c_strike]
@@ -298,7 +286,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["strike"] = np.nan
 
-    # preços
     c_bid = find_col(aliases["bid"])
     c_ask = find_col(aliases["ask"])
     c_last = find_col(aliases["last"])
@@ -306,7 +293,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     if c_ask is not None: out["ask"] = pd.to_numeric(df[c_ask].map(_br_to_float), errors="coerce")
     if c_last is not None: out["last"] = pd.to_numeric(df[c_last].map(_br_to_float), errors="coerce")
 
-    # mid: usa Bid/Ask se houver; senão, Último
     bid_series  = out["bid"]  if "bid"  in out.columns else pd.Series(np.nan, index=df.index)
     ask_series  = out["ask"]  if "ask"  in out.columns else pd.Series(np.nan, index=df.index)
     last_series = out["last"] if "last" in out.columns else pd.Series(np.nan, index=df.index)
@@ -314,7 +300,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     mid_from_quotes = (bid_series.fillna(0) + ask_series.fillna(0)) / 2.0
     out["mid"] = np.where(has_quote, mid_from_quotes, last_series)
 
-    # IV / Delta
     c_iv = find_col(aliases["impliedVol"])
     if c_iv is not None:
         out["impliedVol"] = pd.to_numeric(df[c_iv].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
@@ -322,7 +307,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     if c_delta is not None:
         out["delta"] = pd.to_numeric(df[c_delta].map(_br_to_float), errors="coerce")
 
-    # expiration
     c_exp = find_col(aliases["expiration"])
     exp_series = None
     if c_exp is not None:
@@ -337,7 +321,6 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["expiration"] = np.nan
 
-    # completa faltantes essenciais
     for col in ["type","strike","mid","expiration"]:
         if col not in out.columns: out[col] = np.nan
 
@@ -351,11 +334,9 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
         if "expiration" in out.columns:
             st.write("Exemplo vencimentos:", out["expiration"].dropna().astype(str).head(5).tolist())
         st.dataframe(out.head())
-
     return out
 
 def read_uploaded_file(file) -> pd.DataFrame:
-    """Tenta ler header=0 e fallback header=1. Aceita .xlsx/.csv."""
     name = file.name.lower()
     file_bytes = file.getvalue()
     def try_read(header):
@@ -374,23 +355,16 @@ def read_uploaded_file(file) -> pd.DataFrame:
     raise RuntimeError("Falha ao ler a planilha (.xlsx/.csv).")
 
 def read_pasted_table(text: str) -> pd.DataFrame:
-    """Tenta interpretar o texto colado: HTML <table>, CSV/TSV, ou tabela com separadores.
-       Retorna DataFrame cru (a normalização vem depois)."""
     raw = text.strip()
     if raw == "":
         raise ValueError("Texto vazio.")
-
-    # 1) HTML de tabela
     if "<table" in raw.lower() and "</table>" in raw.lower():
         try:
-            dfs = pd.read_html(raw)  # requer lxml
-            # pega a tabela mais "larga"
+            dfs = pd.read_html(raw)
             df = max(dfs, key=lambda d: d.shape[1])
             return df.dropna(how="all")
         except Exception:
             pass
-
-    # 2) CSV/TSV – detectar separador predominante dentre ; , \t
     lines = [ln for ln in raw.splitlines() if ln.strip()][:20]
     cand = {";":0, ",":0, "\t":0, "|":0}
     for ln in lines:
@@ -403,23 +377,18 @@ def read_pasted_table(text: str) -> pd.DataFrame:
             return df.dropna(how="all")
     except Exception:
         pass
-
-    # 3) Espaços múltiplos como separador (tabela colada “pura”)
     try:
         df = pd.read_csv(io.StringIO(raw), sep=r"\s{2,}", engine="python")
         if df.shape[1] >= 2:
             return df.dropna(how="all")
     except Exception:
         pass
-
-    # 4) Tenta tabulador fixo via split manual (fallback simples)
     rows = [re.split(r"\s{2,}|\t|\|", ln.strip()) for ln in raw.splitlines() if ln.strip()]
     width = max(len(r) for r in rows)
     rows = [r + [""]*(width-len(r)) for r in rows]
     df = pd.DataFrame(rows[1:], columns=rows[0])
     return df.dropna(how="all")
 
-# ----------- UI: entrada -----------
 if mode.startswith("📄"):
     uploaded = st.file_uploader("Envie o Excel/CSV exportado do opcoes.net", type=["xlsx","xls","csv"])
     if uploaded is None:
@@ -444,10 +413,8 @@ else:
         st.error(f"Não consegui entender o texto colado: {e}")
         st.stop()
 
-# ----------- Normalização comum -----------
 chain_all = normalize_opcoesnet_df(df_raw)
 
-# ----------- Vencimentos -----------
 valid_exps = sorted([d if isinstance(d, date) else (d.date() if isinstance(d, datetime) else None)
                      for d in chain_all["expiration"].dropna().unique().tolist()])
 valid_exps = [d for d in valid_exps if isinstance(d, date)]
@@ -460,9 +427,7 @@ T = yearfrac(date.today(), exp_choice)
 days_to_exp = (exp_choice - date.today()).days
 df = chain_all[chain_all["expiration"] == exp_choice].copy()
 
-# ----------- Completa IV/Δ e type -----------
 df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
-
 if "type" not in df.columns or df["type"].isna().all():
     guess = pd.Series(None, index=df.index, dtype="object")
     guess.loc[(df["strike"] > spot)] = "C"
@@ -494,7 +459,6 @@ if need.any():
         vals.append(d)
     df.loc[need, "delta"] = vals
 
-# ----------- Seleção OTM + filtros -----------
 calls = df[(df["type"]=="C") & (df["strike"]>spot)].copy()
 puts  = df[(df["type"]=="P") & (df["strike"]<spot)].copy()
 if calls.empty: calls = df[df["strike"]>spot].copy(); calls["type"]="C"
@@ -514,7 +478,6 @@ with st.expander("🔎 Diagnóstico de filtros (OTM)"):
     if not calls.empty: st.write("Exemplo calls:", calls[["strike","mid","delta"]].head())
     if not puts.empty:  st.write("Exemplo puts:",  puts[["strike","mid","delta"]].head())
 
-# ----------- Cobertura -----------
 st.markdown("### 4) Cobertura e tamanho do contrato")
 colA, colB, colC = st.columns(3)
 with colA:
@@ -532,18 +495,15 @@ def max_qty_put_for_strike(Kp: float) -> int:
     if lot_size <= 0 or Kp <= 0: return 0
     return int(cash_available // (Kp * lot_size))
 
-# ----------- Montagem dos strangles cobertos -----------
 def prob_side(row, side):
     K = float(row["strike"])
     sigma = float(row.get("iv_eff", np.nan)) if not np.isnan(row.get("iv_eff", np.nan)) else hv20
     sigma = max(sigma, 1e-6)
     return prob_ITM_call(spot, K, r, sigma, T) if side=="C" else prob_ITM_put(spot, K, r, sigma, T)
 
-# calcula prob_ITM por lado (usado no score)
 calls["prob_ITM"] = [prob_side(rw, "C") for _, rw in calls.iterrows()]
 puts["prob_ITM"]  = [prob_side(rw, "P") for _, rw in puts.iterrows()]
 for dfx in (calls, puts):
-    # se BS falhar, usa |Δ| como aproximação
     mask = dfx["prob_ITM"].isna() & dfx.get("delta", pd.Series(np.nan, index=dfx.index)).notna()
     dfx.loc[mask, "prob_ITM"] = dfx.loc[mask, "delta"].abs()
 
@@ -578,7 +538,7 @@ for _, c in calls.iterrows():
         })
 
 if not combos:
-    st.warning("Não há strangles possíveis com os filtros/limites atuais. Revise diagnóstico de colunas/strikes/preços.")
+    st.warning("Não há strangles possíveis com os filtros/limites atuais. Revise diagnóstico de colunas/strikes/preços e experimente outro vencimento.")
     st.stop()
 
 combo_df = pd.DataFrame(combos)
@@ -588,7 +548,6 @@ combo_df["poe_inside"] = (1 - combo_df["poe_total"]).clip(0,1)
 combo_df["risk_score"] = combo_df["poe_total"] / 2.0
 combo_df["score_final"] = combo_df["retorno_pct"] / (combo_df["risk_score"] + 0.01)
 
-# ----------- Saída didática -----------
 with st.expander("📘 Regras didáticas de saída"):
     st.markdown("""
 - **Quando sair**  
@@ -600,7 +559,6 @@ with st.expander("📘 Regras didáticas de saída"):
   • Ou **encerrar** o strangle recomprando as duas pernas.
 """)
 
-# ----------- Top 3 -----------
 st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
 top3 = combo_df.sort_values(by=["score_final","credit_total_por_contrato"], ascending=[False,False]).head(3)
 display_cols = ["call_symbol","K_call","put_symbol","K_put","credit_total_por_contrato",
@@ -617,7 +575,6 @@ st.dataframe(
     use_container_width=True
 )
 
-# ----------- Tabela completa -----------
 st.subheader("📋 Sugestões ranqueadas")
 show_cols = ["ticker","call_symbol","K_call","put_symbol","K_put","credit_total_por_contrato",
              "retorno_pct","poe_total","poe_inside","qty","BE_low","BE_high","iv_eff_avg","expiration","score_final"]
@@ -634,7 +591,6 @@ st.dataframe(
     use_container_width=True
 )
 
-# ----------- Payoff -----------
 st.markdown("### 📈 Payoff no Vencimento (P/L por ação)")
 combo_df["__id__"] = (
     combo_df["K_put"].round(2).astype(str) + "–" + combo_df["K_call"].round(2).astype(str) +
@@ -652,7 +608,6 @@ plt.title(f"{TICKER} — Payoff | Kp={Kp:.2f}, Kc={Kc:.2f}, Crédito≈R$ {credi
 plt.xlabel("Preço no vencimento (S)"); plt.ylabel("P/L por ação (R$)")
 st.pyplot(fig, use_container_width=True)
 
-# ----------- Comparar estratégias -----------
 def _nearest_strike(df, typ, target, side):
     d = df[df["type"]==typ].copy()
     if d.empty: return None
@@ -748,4 +703,4 @@ with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Li
 - Iron Condor: Strangle + max(0, Kp_w − S) + max(0, S − Kc_w) − custo_das_asas.  
 - Jade Lizard: −max(0, Kp − S) − max(0, S − Kc) + max(0, S − Kc_w) + crédito_líquido.
 """)
-# -------------------- Fim --------------------
+# --- fim ---
