@@ -3,7 +3,7 @@
 # - Busca tickers B3 (Dados de Mercado)
 # - Upload Excel/CSV com detecção automática de header (linha 2 OU 1)
 # - Vencimento por nome OU fallback na COLUNA B (dd/mm/aaaa)
-# - Normalização de 'type' (C/P) com múltiplas heurísticas + fallback por strike vs. spot
+# - Normalização de 'type' (C/P) com múltiplas heurísticas + fallback por strike vs. spot (sem np.where)
 # - Cálculo de mid robusto, deltas por BS quando faltarem
 # - Sugestões de strangle vendido coberto + instruções de saída
 # - Aba 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)
@@ -306,7 +306,10 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
 
     # strike
     c_strike = find_col(aliases["strike"])
-    out["strike"] = pd.to_numeric(df[c_strike].map(_br_to_float), errors="coerce") if c_strike else np.nan
+    if c_strike:
+        out["strike"] = pd.to_numeric(df[c_strike].map(_br_to_float), errors="coerce")
+    else:
+        out["strike"] = np.nan
 
     # preços
     c_bid = find_col(aliases["bid"])
@@ -377,7 +380,9 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
         if "type" in out.columns:
             st.write("Contagem por type (bruto):", out["type"].value_counts(dropna=False))
         if "strike" in out.columns:
-            st.write("Exemplo strikes:", out["strike"].dropna().head(5).tolist())
+            ex_strikes = out["strike"].dropna().astype(float)
+            st.write("Qtde de strikes válidos:", int(ex_strikes.shape[0]))
+            st.write("Exemplo strikes:", ex_strikes.head(10).tolist())
         if "expiration" in out.columns:
             st.write("Exemplo vencimentos:", out["expiration"].dropna().astype(str).head(5).tolist())
         st.dataframe(out.head())
@@ -402,11 +407,16 @@ T = yearfrac(date.today(), exp_choice if isinstance(exp_choice,date) else exp_ch
 days_to_exp = (exp_choice - date.today()).days if isinstance(exp_choice,date) else (exp_choice.date() - date.today()).days
 df = chain_all[chain_all["expiration"] == exp_choice].copy()
 
-# ---- Completa 'type' por fallback strike vs. spot, se necessário ----
+# 🔧 GARANTIA: strike numérico
+df["strike"] = pd.to_numeric(df.get("strike", np.nan), errors="coerce")
+
+# ---- Completa 'type' por fallback strike vs. spot, se necessário (sem np.where) ----
 if "type" not in df.columns or df["type"].isna().all():
-    # inferência pelo strike vs spot (apenas didática e suficiente para OTM)
-    t_guess = np.where(df["strike"] > spot, "C",
-               np.where(df["strike"] < spot, "P", np.nan))
+    t_guess = pd.Series(None, index=df.index, dtype="object")
+    gt = df["strike"] > float(spot)
+    lt = df["strike"] < float(spot)
+    t_guess.loc[gt.fillna(False)] = "C"
+    t_guess.loc[lt.fillna(False)] = "P"
     df["type"] = t_guess
 
 # ---- IV efetiva ----
@@ -423,24 +433,24 @@ need = df["delta"].isna()
 if need.any():
     vals = []
     for _, row in df.loc[need].iterrows():
-        K = float(row["strike"])
+        K = float(row["strike"]) if not pd.isna(row["strike"]) else np.nan
         sigma = float(row["iv_eff"]) if not pd.isna(row["iv_eff"]) and row["iv_eff"]>0 else hv20
         sigma = max(sigma, 1e-6)
-        if str(row["type"]) == "C":
+        t = str(row.get("type"))
+        if t == "C" and not np.isnan(K):
             d = call_delta(spot, K, r, sigma, T)
-        elif str(row["type"]) == "P":
+        elif t == "P" and not np.isnan(K):
             d = put_delta(spot, K, r, sigma, T)
         else:
-            # se ainda não tiver tipo, use heurística rápida
-            d = call_delta(spot, K, r, sigma, T) if K>spot else put_delta(spot, K, r, sigma, T)
+            d = np.nan
         vals.append(d)
     df.loc[need, "delta"] = vals
 
-# ---- Seleção OTM (com fallback, mesmo que 'type' não venha correta) ----
-calls = df[(df["strike"]>spot) & (df["type"]=="C")].copy()
-puts  = df[(df["strike"]<spot) & (df["type"]=="P")].copy()
+# ---- Seleção OTM robusta ----
+calls = df[(df["type"]=="C") & (df["strike"]>spot)].copy()
+puts  = df[(df["type"]=="P") & (df["strike"]<spot)].copy()
 
-# fallback: se não houver C/P suficientes, use apenas o critério do strike vs. spot
+# fallback: se vazio, usar somente critério de strike
 if calls.empty:
     calls = df[df["strike"]>spot].copy()
     calls["type"] = "C"
@@ -470,7 +480,8 @@ def probs(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
     df_side = df_side.copy()
     pr = []
     for _, row in df_side.iterrows():
-        K = float(row["strike"]); sigma = float(row["iv_eff"]) if not pd.isna(row["iv_eff"]) and row["iv_eff"]>0 else hv20
+        K = float(row["strike"]) if not pd.isna(row["strike"]) else np.nan
+        sigma = float(row["iv_eff"]) if not pd.isna(row["iv_eff"]) and row["iv_eff"]>0 else hv20
         sigma = max(sigma, 1e-6)
         p_itm = prob_ITM_call(spot,K,r,sigma,T) if side=="C" else prob_ITM_put(spot,K,r,sigma,T)
         if np.isnan(p_itm) and not np.isnan(row.get("delta", np.nan)):
@@ -490,7 +501,7 @@ def label_band(p):
 
 calls["band"] = calls["prob_ITM"].apply(label_band)
 puts["band"]  = puts["prob_ITM"].apply(label_band)
-# (Se quiser limitar por seleção de bandas)
+# (Se quiser limitar pelas bandas selecionadas:)
 # calls = calls[calls["band"].isin(risk_selection)]
 # puts  = puts[puts["band"].isin(risk_selection)]
 
@@ -545,7 +556,7 @@ for _, c in calls.iterrows():
         })
 
 if not combos:
-    st.warning("Não há strangles possíveis com os filtros/limites atuais. Tente ampliar |Δ| ou conferir ‘mid’.")
+    st.warning("Não há strangles possíveis com os filtros/limites atuais. Verifique se 'strike' veio numérico no arquivo (veja o diagnóstico).")
     st.stop()
 
 combo_df = pd.DataFrame(combos)
