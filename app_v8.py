@@ -122,27 +122,106 @@ def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df.dropna(subset=["expiration","type","strike"], how="any")
 
+# ===== NOVO: Headers de navegador + seletor de tabela e rota alternativa =====
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+}
+
+def choose_options_table(tables: List[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Escolhe a melhor tabela candidata à chain de opções.
+    Critérios: contém colunas típicas e tem bastante conteúdo numérico.
+    """
+    if not tables:
+        return None
+
+    candidates = [
+        "strike", "preço de exercício", "preco de exercicio", "exercicio",
+        "bid", "compra", "melhor compra",
+        "ask", "venda", "melhor venda",
+        "expiration", "vencimento",
+        "type", "tipo"
+    ]
+
+    def score_table(df: pd.DataFrame) -> tuple[int, int, int]:
+        cols = [str(c).lower() for c in df.columns]
+        hits = sum(any(key in c for c in cols) for key in candidates)
+        # células numéricas
+        try:
+            num_cells = int(df.apply(pd.to_numeric, errors="coerce").notna().sum().sum())
+        except Exception:
+            num_cells = 0
+        size = df.shape[0] * df.shape[1]
+        return (hits, num_cells, size)
+
+    best = None
+    best_score = (-1, -1, -1)
+    for t in tables:
+        sc = score_table(t)
+        if sc > best_score:
+            best_score = sc
+            best = t
+    return best
+
 @st.cache_data(show_spinner=False)
-def fetch_optionsnet(url: str) -> pd.DataFrame:
-    """Tenta CSV; se falhar, tenta HTML->read_html (maior tabela)"""
+def fetch_optionsnet(url_primary: str) -> pd.DataFrame:
+    """
+    Tenta a rota padrão e uma rota alternativa com headers reais.
+    Escolhe a melhor tabela encontrada e normaliza.
+    """
     sess = requests.Session()
-    # 1) CSV
+
+    # Extrai ticker base da URL primária
     try:
-        r = sess.get(url, timeout=25)
-        r.raise_for_status()
-        df = try_read_csv_text(r.text)
-        if df is not None and len(df) > 0:
-            return normalize_chain_columns(df)
+        ticker_base = url_primary.rsplit("/", 1)[-1].strip().upper()
     except Exception:
-        pass
-    # 2) HTML
-    r = sess.get(url, timeout=25)
-    r.raise_for_status()
-    tbls = pd.read_html(r.text)
-    if not tbls:
-        raise RuntimeError("Nenhuma tabela encontrada.")
-    df = max(tbls, key=lambda t: t.shape[0] * t.shape[1])
-    return normalize_chain_columns(df)
+        ticker_base = ""
+
+    urls = [
+        url_primary,  # /opcoes/bovespa/{TICKER}
+        f"https://opcoes.net.br/opcoes2/bovespa?ativo={ticker_base}",  # rota alternativa
+    ]
+
+    last_err = None
+    for url in urls:
+        try:
+            # 1) tentativa CSV
+            r = sess.get(url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+
+            df_csv = try_read_csv_text(r.text)
+            if df_csv is not None and len(df_csv) > 0:
+                df_norm = normalize_chain_columns(df_csv)
+                if not df_norm.empty:
+                    return df_norm
+
+            # 2) tentativa HTML (uma ou mais tabelas)
+            tables = pd.read_html(r.text)
+            if tables:
+                best = choose_options_table(tables)
+                if best is not None and not best.empty:
+                    df_norm = normalize_chain_columns(best)
+                    if not df_norm.empty:
+                        return df_norm
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err:
+        raise RuntimeError(f"Nenhuma tabela encontrada (último erro: {type(last_err).__name__}: {last_err})")
+    raise RuntimeError("Nenhuma tabela encontrada nas rotas conhecidas.")
+
+# ============================================================
+# Yahoo/IV helpers
+# ============================================================
 
 @st.cache_data(show_spinner=False)
 def load_spot_and_iv_proxy(yahoo_ticker: str):
@@ -185,7 +264,7 @@ def fetch_b3_ticker_list() -> pd.DataFrame:
     ticker, name.
     """
     url = "https://www.dadosdemercado.com.br/acoes"
-    r = requests.get(url, timeout=30)
+    r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     tables = pd.read_html(r.text)
     if not tables:
@@ -476,7 +555,7 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     combo_df["score_final"] = combo_df["retorno_pct"] / (combo_df["risk_score"] + 0.01)
 
     # ========================================================
-    # NOVO: lógica de SAÍDA e instruções operacionais
+    # Lógica de SAÍDA e instruções operacionais
     # ========================================================
     def build_exit_guidance(row):
         Kc, Kp = row["K_call"], row["K_put"]
