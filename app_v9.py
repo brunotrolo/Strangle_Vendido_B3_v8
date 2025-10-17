@@ -1,13 +1,15 @@
 # app_v9_b3_file.py
-# v9 didático: 1 ticker por vez (lista B3), upload da chain (Excel/CSV),
-# sugestões de strangle coberto + instruções de saída + aba "📈 Comparar estratégias".
-#
-# Requisitos:
-#   pip install streamlit pandas numpy matplotlib requests beautifulsoup4 lxml yfinance openpyxl
+# v9 didático (1 ticker por vez) com:
+# - Lista B3 (Dados de Mercado)
+# - Upload da chain (Excel/CSV)
+# - Tooltips (help=) em TODOS os controles da barra lateral
+# - Mapeamento manual de colunas (inclui Vencimento)
+# - Sugestões de strangle + saídas didáticas
+# - Aba "📈 Comparar estratégias" (Strangle × Iron Condor × Jade Lizard)
 
 import io
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -18,7 +20,7 @@ from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 
 # -------------------------------
-# Configuração básica do app
+# Configuração
 # -------------------------------
 st.set_page_config(
     page_title="Strangle Vendido Coberto — v9 (B3 + arquivo)",
@@ -27,13 +29,13 @@ st.set_page_config(
 )
 
 st.title("💼 Strangle Vendido Coberto — v9 (B3 + arquivo)")
-st.caption("Escolha um ticker da B3, envie sua option chain (Excel/CSV) e receba sugestões + comparação (Strangle × Iron Condor × Jade Lizard) com explicações didáticas.")
+st.caption("Escolha um ticker da B3, mapeie as colunas do seu arquivo, gere sugestões e compare Strangle × Iron Condor × Jade Lizard.")
 
 # -------------------------------
 # Utilidades
 # -------------------------------
-CALL_SERIES = set(list("ABCDEFGHIJKL"))   # Séries CALL (A..L)
-PUT_SERIES  = set(list("MNOPQRSTUVWX"))   # Séries PUT  (M..X)
+CALL_SERIES = set(list("ABCDEFGHIJKL"))
+PUT_SERIES  = set(list("MNOPQRSTUVWX"))
 SQRT_2 = np.sqrt(2.0)
 
 def norm_cdf(x: float) -> float:
@@ -79,11 +81,26 @@ def _br_to_float(x):
     try: return float(s)
     except: return np.nan
 
+def _excel_serial_to_date(n):
+    # Excel: 1 => 1899-12-31, mas há bug do 1900 (pandas usa 1899-12-30)
+    try:
+        n = float(n)
+        if n <= 0: return np.nan
+        base = datetime(1899, 12, 30)
+        return (base + timedelta(days=int(n))).date()
+    except Exception:
+        return np.nan
+
 def _parse_date_any(x):
     if pd.isna(x): return np.nan
     if isinstance(x, (pd.Timestamp, datetime)): return x.date()
     if isinstance(x, date): return x
+    # Se vier número do Excel
+    if isinstance(x, (int, float)) and not np.isnan(x):
+        d = _excel_serial_to_date(x)
+        if isinstance(d, date): return d
     s = str(x).strip()
+    # dd/mm/aaaa etc.
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -95,14 +112,10 @@ def _parse_date_any(x):
         return np.nan
 
 # -------------------------------
-# 1) Buscar lista de tickers da B3 (Dados de Mercado)
+# Tickers da B3 (Dados de Mercado)
 # -------------------------------
 @st.cache_data(ttl=6*60*60, show_spinner=False)
 def fetch_b3_tickers():
-    """
-    Faz scrape da página https://www.dadosdemercado.com.br/acoes
-    e retorna uma lista de tuplas (ticker, nome).
-    """
     url = "https://www.dadosdemercado.com.br/acoes"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -110,12 +123,10 @@ def fetch_b3_tickers():
         resp.raise_for_status()
     except Exception:
         return []
-
     soup = BeautifulSoup(resp.text, "lxml")
-
     tickers = []
-    tables = soup.find_all("table")
-    for tb in tables:
+    # Tabela principal
+    for tb in soup.find_all("table"):
         head = tb.find("thead")
         if not head: continue
         ths = [th.get_text(strip=True).lower() for th in head.find_all("th")]
@@ -130,27 +141,22 @@ def fetch_b3_tickers():
                 if re.match(r"^[A-Z]{4}\d$", tk):
                     tickers.append((tk, nm))
             break
-
+    # Fallback por links
     if not tickers:
-        links = soup.find_all("a", href=True)
-        for a in links:
-            href = a["href"]
-            m = re.match(r"^/acoes/([A-Z]{4}\d)$", href)
+        for a in soup.find_all("a", href=True):
+            m = re.match(r"^/acoes/([A-Z]{4}\d)$", a["href"])
             if m:
                 tk = m.group(1)
                 nm = a.get_text(strip=True)
                 tickers.append((tk, nm or tk))
-
-    dedup = {tk: nm for tk, nm in tickers}
-    tickers = sorted(dedup.items(), key=lambda x: x[0])
-    return tickers
+    return sorted({tk: nm for tk, nm in tickers}.items(), key=lambda x: x[0])
 
 tickers_list = fetch_b3_tickers()
 if not tickers_list:
-    st.warning("Não consegui carregar a lista de tickers do site. Você ainda pode digitar o ticker manualmente abaixo.")
+    st.warning("Não consegui carregar a lista de tickers do site. Você ainda pode digitar o ticker manualmente.")
 
 # -------------------------------
-# 2) Escolha de 1 ticker por vez
+# Escolha de 1 ticker por vez
 # -------------------------------
 col_tk1, col_tk2 = st.columns([2,1])
 with col_tk1:
@@ -162,71 +168,54 @@ with col_tk1:
         TICKER = st.text_input("Digite o ticker (ex.: PETR4, VALE3, ITUB4)", value="PETR4").strip().upper()
 with col_tk2:
     st.metric("Ticker selecionado", TICKER if TICKER else "—")
-
-if not TICKER:
-    st.stop()
+if not TICKER: st.stop()
 
 # -------------------------------
-# Sidebar — parâmetros didáticos
+# Sidebar — parâmetros com tooltips
 # -------------------------------
 with st.sidebar:
-    st.header("⚙️ Parâmetros (explicativos)")
-    st.markdown(
-        """
-**Taxa livre de risco anual (r)**  
-Usada no Black–Scholes. No Brasil, aproxime pela SELIC anualizada.  
-**Ex.:** 0,11 = 11% a.a.
-
-**|Δ| mínimo e |Δ| máximo**  
-Filtro de “moneyness” por Delta.  
-Vendedores costumam usar **|Δ| ~ 0,05–0,35** (opções OTM).
-
-**Bandas de risco por perna**  
-Classificação didática pela **probabilidade de exercício (PoE) de cada perna**:  
-Baixo: 0–15% • Médio: 15–35% • Alto: 35–55%.  
-A sugestão cruza CALL e PUT **na mesma banda**.
-
-**Janela p/ IV Rank/Percentil (dias)**  
-Compara a IV atual vs histórico (proxy por HV20 se IV faltar).  
-IV mais alta → melhor para **venda de prêmio**.
-
-**Instruções de SAÍDA**  
-Recomprar a **perna ameaçada** quando o preço encosta no strike **perto do vencimento**  
-ou encerrar após capturar **70–80% do prêmio**.
-
-**Dias até vencimento (alerta)**  
-Com **≤ N dias**, mensagens de saída ficam mais **proativas**.
-
-**Proximidade ao strike (%)**  
-Considera o strike “ameaçado” quando **S** está a menos de **X%** dele.
-
-**Meta de captura do prêmio (%)**  
-Meta para encerrar com ganho parcial (ex.: **70%** já capturado → zera o risco).
-        """
+    st.header("⚙️ Parâmetros")
+    r = st.number_input(
+        "Taxa livre de risco anual (r)",
+        min_value=0.0, max_value=1.0, value=0.11, step=0.005, format="%.3f",
+        help="Usada no Black–Scholes. No Brasil, aproxime pela SELIC anualizada. Ex.: 0,11 = 11% a.a."
+    )
+    delta_min = st.number_input(
+        "|Δ| mínimo", min_value=0.0, max_value=1.0, value=0.00, step=0.01,
+        help="Filtro de ‘moneyness’ por Delta (menor = mais OTM)."
+    )
+    delta_max = st.number_input(
+        "|Δ| máximo", min_value=0.0, max_value=1.0, value=0.35, step=0.01,
+        help="Vendedores costumam usar |Δ| ~ 0,05–0,35 (opções OTM)."
+    )
+    risk_selection = st.multiselect(
+        "Bandas de risco por perna", ["Baixo","Médio","Alto"], default=["Baixo","Médio","Alto"],
+        help="Classifica pela prob. de exercício (PoE) de cada perna: Baixo 0–15%, Médio 15–35%, Alto 35–55%."
+    )
+    lookback_days = st.number_input(
+        "Janela p/ IV Rank/Percentil (dias)", min_value=60, max_value=500, value=252, step=1,
+        help="Compara a IV atual vs histórico (proxy por HV20 se IV faltar). IV alta favorece vender prêmio."
     )
     st.markdown("---")
-    r = st.number_input("Taxa livre de risco anual (r)", min_value=0.0, max_value=1.0, value=0.11, step=0.005, format="%.3f")
-    delta_min = st.number_input("|Δ| mínimo", min_value=0.0, max_value=1.0, value=0.00, step=0.01)
-    delta_max = st.number_input("|Δ| máximo", min_value=0.0, max_value=1.0, value=0.35, step=0.01)
-    risk_selection = st.multiselect("Bandas de risco por perna", ["Baixo","Médio","Alto"], default=["Baixo","Médio","Alto"])
-    lookback_days = st.number_input("Janela p/ IV Rank/Percentil (dias)", min_value=60, max_value=500, value=252, step=1)
-    st.markdown("---")
-    show_exit_help = st.checkbox("Mostrar instruções de SAÍDA", value=True)
-    days_exit_thresh = st.number_input("Dias até vencimento p/ alerta", min_value=1, max_value=30, value=10)
-    prox_pct = st.number_input("Proximidade ao strike (%)", min_value=1, max_value=20, value=5) / 100.0
-    capture_target = st.number_input("Meta de captura do prêmio (%)", min_value=10, max_value=95, value=70) / 100.0
+    show_exit_help = st.checkbox(
+        "Mostrar instruções de SAÍDA", value=True,
+        help="Recomprar a perna ameaçada perto do vencimento OU encerrar após capturar 70–80% do prêmio."
+    )
+    days_exit_thresh = st.number_input(
+        "Dias até vencimento p/ alerta", min_value=1, max_value=30, value=10,
+        help="Com ≤ N dias, as mensagens de saída ficam mais proativas."
+    )
+    prox_pct = st.number_input(
+        "Proximidade ao strike (%)", min_value=1, max_value=20, value=5,
+        help="Considera o strike ‘ameaçado’ quando S está a menos de X% dele."
+    ) / 100.0
+    capture_target = st.number_input(
+        "Meta de captura do prêmio (%)", min_value=10, max_value=95, value=70,
+        help="Meta para encerrar com ganho parcial (ex.: 70% já capturado → zera o risco)."
+    ) / 100.0
 
 # -------------------------------
-# 3) Upload da option chain para o ticker escolhido
-# -------------------------------
-st.markdown(f"### 3) Envie o arquivo da *option chain* (Excel/CSV) para **{TICKER}**")
-uploaded = st.file_uploader(
-    "O app normaliza colunas comuns (Símbolo/Código, Vencimento, Tipo C/P, Strike, Bid/Ask/Último, Delta, IV).",
-    type=["xlsx","xls","csv"]
-)
-
-# -------------------------------
-# Spot e HV20 (proxy de IV)
+# Spot e HV20 (proxy IV)
 # -------------------------------
 @st.cache_data(show_spinner=False)
 def load_spot_and_hv20(yahoo_ticker: str):
@@ -236,8 +225,7 @@ def load_spot_and_hv20(yahoo_ticker: str):
         if len(hist) >= 30:
             spot_val = float(hist["Close"].iloc[-1])
             rets = hist["Close"].pct_change()
-            daily_vol = rets.rolling(20).std()
-            hv20 = (daily_vol * np.sqrt(252)).dropna()
+            hv20 = (rets.rolling(20).std() * np.sqrt(252)).dropna()
             return float(spot_val), float(hv20.iloc[-1])
     except Exception:
         pass
@@ -248,124 +236,132 @@ c1,c2,c3 = st.columns(3)
 with c1: st.metric("Preço à vista (S)", f"{spot:,.2f}" if not np.isnan(spot) else "—")
 with c2: st.metric("HV20 (σ anual – proxy)", f"{hv20:.2%}" if not np.isnan(hv20) else "—")
 with c3: st.metric("r (anual)", f"{r:.2%}")
-
-if uploaded is None:
-    st.info("👉 Envie a planilha/CSV da *option chain* para continuar.")
-    st.stop()
-
-# -------------------------------
-# Leitura e normalização do arquivo
-# -------------------------------
-def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
-    colmap = {
-        'symbol': ['symbol','símbolo','simbolo','ticker','codigo','código','opção','opcao','código da opção','codigo da opcao'],
-        'expiration': ['expiration','venc','vencimento','expiração','expiracao','expiry','venc.','vencimento (d/m/a)'],
-        'type': ['type','tipo','opção','opcao','option_type','class'],
-        'strike': ['strike','preço de exercício','preco de exercicio','exercicio','k','strike_price','preço de exercício (r$)'],
-        'bid': ['bid','compra','melhor compra','oferta de compra'],
-        'ask': ['ask','venda','melhor venda','oferta de venda'],
-        'last': ['last','último','ultimo','preço','preco','close','último negócio','ultimo negocio','último neg.','ult.'],
-        'impliedVol': ['iv','ivol','impliedvol','implied_vol','vol implícita','vol implicita','vol. impl. (%)','vol impl (%)','iv (%)'],
-        'delta': ['delta','Δ']
-    }
-    rename = {}
-    lowcols = {c.lower().strip(): c for c in df.columns}
-    for target, aliases in colmap.items():
-        for a in aliases:
-            if a.lower() in lowcols:
-                rename[lowcols[a.lower()]] = target
-                break
-    df = df.rename(columns=rename)
-
-    # Inferir tipo C/P pela letra da série do código da opção (se faltar)
-    if 'type' not in df.columns and 'symbol' in df.columns:
-        def infer_type(code: str):
-            if not isinstance(code, str): return np.nan
-            s = re.sub(r'[^A-Z0-9]', '', str(code).upper().strip())
-            m = re.search(r'([A-Z])\d+$', s)
-            if not m: return np.nan
-            letra = m.group(1)
-            if letra in CALL_SERIES: return 'C'
-            if letra in PUT_SERIES:  return 'P'
-            return np.nan
-        df['type'] = df['symbol'].map(infer_type)
-
-    # Numéricos
-    for c in ["strike","bid","ask","last","impliedVol","delta"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c].map(_br_to_float), errors="coerce")
-
-    # Data de vencimento
-    if "expiration" in df.columns:
-        df["expiration"] = df["expiration"].map(_parse_date_any)
-
-    # Garantias
-    for c in ["symbol","expiration","type","strike"]:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df["type"] = df["type"].astype(str).str.upper().str.strip().replace({
-        'CALL':'C','C':'C','COMPRA':'C','CALLS':'C',
-        'PUT':'P','P':'P','VENDA':'P','PUTS':'P'
-    })
-    return df.dropna(subset=["type","strike"])  # 'symbol' pode faltar; 1 ticker por vez
-
-def read_chain_from_uploaded(file) -> pd.DataFrame:
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        data = file.read().decode("utf-8", errors="ignore")
-        df = pd.read_csv(io.StringIO(data))
-        return normalize_chain_columns(df)
-    else:
-        try:
-            xls = pd.ExcelFile(file, engine="openpyxl")
-        except Exception:
-            raise RuntimeError("Para .xlsx, inclua `openpyxl` no requirements. Alternativa: exporte para CSV.")
-        best_len, best_df = -1, None
-        for sheet in xls.sheet_names:
-            try:
-                df = xls.parse(sheet)
-                if df.shape[0] > best_len and df.shape[1] >= 4:
-                    best_len, best_df = df.shape[0], df
-            except Exception:
-                continue
-        if best_df is None:
-            raise RuntimeError("Não foi possível ler nenhuma planilha válida do Excel.")
-        return normalize_chain_columns(best_df)
-
-try:
-    chain_all = read_chain_from_uploaded(uploaded)
-except Exception as e:
-    st.error(f"Falha ao ler o arquivo: {e}")
-    st.stop()
-
 if np.isnan(spot) or spot <= 0:
     st.error("Não foi possível obter o preço à vista (Yahoo). Verifique o ticker.")
     st.stop()
 
 # -------------------------------
-# Seleção de vencimento
+# Upload e mapeamento de colunas
 # -------------------------------
-valid_exps = sorted([d for d in chain_all["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))])
-if not valid_exps:
-    st.error("Nenhum vencimento válido encontrado no arquivo. Verifique a coluna de Vencimento.")
+st.markdown(f"### 3) Envie a *option chain* (Excel/CSV) para **{TICKER}**")
+uploaded = st.file_uploader(
+    "Mapeie as colunas logo abaixo. Aceita: Símbolo/Código, Vencimento, Tipo C/P, Strike, Bid/Ask/Último, Delta, IV.",
+    type=["xlsx","xls","csv"]
+)
+if uploaded is None:
+    st.info("👉 Envie o arquivo para continuar.")
     st.stop()
 
-exp_choice = st.selectbox("📅 Vencimento", options=valid_exps, index=0)
-T = yearfrac(date.today(), exp_choice if isinstance(exp_choice,date) else exp_choice.date())
-days_to_exp = (exp_choice - date.today()).days if isinstance(exp_choice,date) else (exp_choice.date() - date.today()).days
-df = chain_all[chain_all["expiration"] == exp_choice].copy()
+def read_raw(file) -> pd.DataFrame:
+    name = file.name.lower()
+    if name.endswith(".csv"):
+        data = file.read().decode("utf-8", errors="ignore")
+        return pd.read_csv(io.StringIO(data))
+    else:
+        try:
+            xls = pd.ExcelFile(file, engine="openpyxl")
+        except Exception:
+            raise RuntimeError("Para .xlsx, adicione `openpyxl` no requirements. Alternativa: exporte a planilha para CSV.")
+        best_len, best_df = -1, None
+        for sheet in xls.sheet_names:
+            try:
+                df = xls.parse(sheet)
+                if df.shape[0] > best_len and df.shape[1] >= 2:
+                    best_len, best_df = df.shape[0], df
+            except Exception:
+                continue
+        if best_df is None:
+            raise RuntimeError("Não foi possível ler nenhuma planilha válida do Excel.")
+        return best_df
 
-# Preço médio (mid) e IV efetiva
+try:
+    raw = read_raw(uploaded)
+except Exception as e:
+    st.error(f"Falha ao ler o arquivo: {e}")
+    st.stop()
+
+st.markdown("#### 3.1) Mapeie as colunas do arquivo")
+cols = list(raw.columns)
+col1, col2, col3 = st.columns(3)
+with col1:
+    map_symbol = st.selectbox("Símbolo/Código da opção (opcional)", ["(nenhum)"] + cols, index=0,
+                              help="Código da opção (ex.: PETRA40). Se não tiver, deixa ‘(nenhum)’.")
+    map_type   = st.selectbox("Tipo (C/P)", cols,
+                              help="Coluna com ‘C’ para CALL e ‘P’ para PUT.")
+    map_strike = st.selectbox("Strike (K)", cols, help="Preço de exercício da opção.")
+with col2:
+    map_exp    = st.selectbox("Vencimento (data)", cols,
+                              help="Coluna de data de vencimento. Aceita dd/mm/aaaa, yyyy-mm-dd ou número do Excel.")
+    map_bid    = st.selectbox("Bid (compra) — opcional", ["(nenhum)"] + cols, index=0,
+                              help="Melhor preço de compra. Se não tiver, deixe vazio.")
+    map_ask    = st.selectbox("Ask (venda) — opcional", ["(nenhum)"] + cols, index=0,
+                              help="Melhor preço de venda. Se não tiver, deixe vazio.")
+with col3:
+    map_last   = st.selectbox("Último — opcional", ["(nenhum)"] + cols, index=0,
+                              help="Último preço negociado (fallback do mid).")
+    map_iv     = st.selectbox("IV (%) — opcional", ["(nenhum)"] + cols, index=0,
+                              help="Volatilidade implícita anual (ex.: 45 = 45%).")
+    map_delta  = st.selectbox("Delta — opcional", ["(nenhum)"] + cols, index=0,
+                              help="Delta da opção (se faltar, calculamos pelo BS/HV20).")
+
+# Constrói DF normalizado a partir do mapeamento
+df = pd.DataFrame()
+def _get(col):
+    return None if col == "(nenhum)" else col
+
+if _get(map_symbol): df["symbol"] = raw[_get(map_symbol)]
+df["type"]       = raw[map_type]
+df["strike"]     = pd.to_numeric(raw[map_strike].map(_br_to_float), errors="coerce")
+df["expiration"] = raw[map_exp].map(_parse_date_any)
+
+if _get(map_bid):  df["bid"]  = pd.to_numeric(raw[_get(map_bid)].map(_br_to_float), errors="coerce")
+if _get(map_ask):  df["ask"]  = pd.to_numeric(raw[_get(map_ask)].map(_br_to_float), errors="coerce")
+if _get(map_last): df["last"] = pd.to_numeric(raw[_get(map_last)].map(_br_to_float), errors="coerce")
+if _get(map_iv):   df["impliedVol"] = pd.to_numeric(raw[_get(map_iv)].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
+if _get(map_delta):df["delta"] = pd.to_numeric(raw[_get(map_delta)].map(_br_to_float), errors="coerce")
+
+# Tipo C/P (normaliza e/ou infere por letra da série, se precisar)
+df["type"] = df["type"].astype(str).str.upper().str.strip().replace({
+    'CALL':'C','COMPRA':'C','C':'C',
+    'PUT':'P','VENDA':'P','P':'P'
+})
+if "symbol" in df.columns and df["type"].isna().any():
+    def infer_type(code: str):
+        if not isinstance(code, str): return np.nan
+        s = re.sub(r'[^A-Z0-9]', '', str(code).upper().strip())
+        m = re.search(r'([A-Z])\d+$', s)
+        if not m: return np.nan
+        letra = m.group(1)
+        if letra in CALL_SERIES: return 'C'
+        if letra in PUT_SERIES:  return 'P'
+        return np.nan
+    df.loc[df["type"].isna(), "type"] = df.loc[df["type"].isna(), "symbol"].map(infer_type)
+
+# Mid price
 if "bid" in df.columns and "ask" in df.columns and (df["bid"].notna().any() or df["ask"].notna().any()):
     df["mid"] = (df["bid"].fillna(0) + df["ask"].fillna(0)) / 2.0
 else:
     df["mid"] = df.get("last", np.nan).fillna(0)
-if "impliedVol" not in df.columns:
-    df["impliedVol"] = np.nan
+
+# IV efetiva (usa HV20 se não veio IV)
+if "impliedVol" not in df.columns: df["impliedVol"] = np.nan
 df["iv_eff"] = df["impliedVol"]
-if df["iv_eff"].isna().all():  # fallback para HV20 se IV não existir
+if df["iv_eff"].isna().all():
     df["iv_eff"] = hv20
+
+# Valida vencimentos
+valid_exps = sorted([d for d in df["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))])
+if not valid_exps:
+    st.error("Nenhum vencimento válido encontrado. Revise o mapeamento (principalmente a coluna de Vencimento).")
+    st.stop()
+
+# -------------------------------
+# Seleção de vencimento
+# -------------------------------
+exp_choice = st.selectbox("📅 Vencimento", options=valid_exps, index=0)
+T = yearfrac(date.today(), exp_choice if isinstance(exp_choice,date) else exp_choice.date())
+days_to_exp = (exp_choice - date.today()).days if isinstance(exp_choice,date) else (exp_choice.date() - date.today()).days
+df = df[df["expiration"] == exp_choice].copy()
 
 # Separa OTM
 calls = df[(df["type"]=="C") & (df["strike"]>spot)].copy()
@@ -396,7 +392,7 @@ def dfilter(dfi: pd.DataFrame) -> pd.DataFrame:
 
 calls = dfilter(calls); puts = dfilter(puts)
 
-# Prob ITM e bandas didáticas
+# Prob ITM + bandas
 def probs(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
     df_side = df_side.copy()
     pr = []
@@ -425,15 +421,18 @@ puts["band"]  = puts["prob_ITM"].apply(label_band)
 calls = calls[calls["band"].isin(risk_selection)]
 puts  = puts[puts["band"].isin(risk_selection)]
 
-# Entradas específicas por ticker
+# Cobertura por ticker
 st.markdown("### 4) Cobertura e tamanho do contrato")
 colA, colB, colC = st.columns(3)
 with colA:
-    shares_owned = st.number_input(f"Ações em carteira ({TICKER})", min_value=0, step=100, value=0)
+    shares_owned = st.number_input(f"Ações em carteira ({TICKER})", min_value=0, step=100, value=0,
+                                   help="Quantidade de ações livres na carteira para cobrir as CALLs (1 lote = ‘Tamanho do contrato’).")
 with colB:
-    cash_available = st.number_input(f"Caixa disponível (R$) ({TICKER})", min_value=0.0, step=100.0, value=10000.0, format="%.2f")
+    cash_available = st.number_input(f"Caixa disponível (R$) ({TICKER})", min_value=0.0, step=100.0, value=10000.0, format="%.2f",
+                                     help="Dinheiro reservado para cobrir a PUT (compra ao strike × tamanho do contrato).")
 with colC:
-    lot_size = st.number_input(f"Tamanho do contrato ({TICKER})", min_value=1, step=1, value=100)
+    lot_size = st.number_input(f"Tamanho do contrato ({TICKER})", min_value=1, step=1, value=100,
+                               help="Na B3, ações geralmente 100; use o valor do seu contrato.")
 
 max_qty_call = (shares_owned // lot_size) if lot_size > 0 else 0
 def max_qty_put_for_strike(Kp: float) -> int:
@@ -513,9 +512,7 @@ if show_exit_help:
     combo_df["Instrucao_saida"] = exit_texts
     combo_df["Alerta_saida"] = alerts
 
-# -------------------------------
-# Saída — Top 3 e tabela completa
-# -------------------------------
+# Top 3 e tabela
 st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
 top3 = combo_df.sort_values(by=["score_final","credit_total_por_contrato"], ascending=[False,False]).head(3)
 display_cols = ["call_symbol","K_call","put_symbol","K_put","credit_total_por_contrato","poe_total","retorno_pct","score_final","qty","BE_low","BE_high"]
@@ -532,15 +529,10 @@ show_cols = ["ticker","call_symbol","K_call","probITM_call","delta_call",
              "qty","BE_low","BE_high","iv_eff_avg","expiration","score_final"]
 if show_exit_help:
     show_cols += ["Alerta_saida","Instrucao_saida"]
-
-fmt = {"K_call":"%.2f","K_put":"%.2f",
-       "probITM_call":"{:.0%}","probITM_put":"{:.0%}",
-       "delta_call":"{:.2f}","delta_put":"{:.2f}",
-       "credit_total_por_contrato":"R$ {:.2f}",
+fmt = {"K_call":"%.2f","K_put":"%.2f","probITM_call":"{:.0%}","probITM_put":"{:.0%}",
+       "delta_call":"{:.2f}","delta_put":"{:.2f}","credit_total_por_contrato":"R$ {:.2f}",
        "retorno_pct":"{:.2%}","poe_total":"{:.0%}","poe_inside":"{:.0%}",
-       "BE_low":"R$ {:.2f}","BE_high":"R$ {:.2f}",
-       "iv_eff_avg":"{:.0%}","score_final":"{:.2f}"}
-
+       "BE_low":"R$ {:.2f}","BE_high":"R$ {:.2f}","iv_eff_avg":"{:.0%}","score_final":"{:.2f}"}
 st.dataframe(
     combo_df[show_cols].rename(columns={
         "call_symbol":"CALL","put_symbol":"PUT","iv_eff_avg":"IV (média)",
@@ -551,9 +543,7 @@ st.dataframe(
     use_container_width=True
 )
 
-# -------------------------------
-# Payoff de uma estrutura (visual)
-# -------------------------------
+# Payoff (uma estrutura)
 st.markdown("### 📈 Payoff no Vencimento (P/L por ação)")
 combo_df["__id__"] = (
     combo_df["call_symbol"].astype(str) + " & " + combo_df["put_symbol"].astype(str) +
@@ -606,7 +596,7 @@ def payoff_arrays_jade_lizard(S, Kp, Kc, Kc_w, credit_net):
     return short_put + short_call + long_call + credit_net
 
 with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)"):
-    st.markdown("Selecione um **strangle** base abaixo. O app constrói automaticamente as asas para Condor/Jade Lizard.")
+    st.markdown("Selecione um **strangle** base; o app monta automaticamente as asas do Condor/Jade Lizard.")
     base_id = (
         combo_df["K_put"].round(2).astype(str) + "–" + combo_df["K_call"].round(2).astype(str) +
         " | crédito≈" + combo_df["credit_total_por_contrato"].round(2).astype(str)
@@ -617,10 +607,10 @@ with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Li
     rowb = tmp[tmp["__base__"]==pick].iloc[0]
     Kp_b, Kc_b, cred_b = float(rowb["K_put"]), float(rowb["K_call"]), float(rowb["credit_total_por_contrato"])
 
-    wing_pct = st.slider("Largura das asas (proporção do preço à vista)", min_value=2, max_value=15, value=5, step=1) / 100.0
+    wing_pct = st.slider("Largura das asas (% do preço à vista)", min_value=2, max_value=15, value=5, step=1,
+                         help="Define o quão distantes estarão as asas (PUT comprada e CALL comprada) do strangle base.") / 100.0
     Kc_target = Kc_b + wing_pct * spot
     Kp_target = Kp_b - wing_pct * spot
-
     kc_w_tuple = _nearest_strike(df, 'C', Kc_target, side='above')
     kp_w_tuple = _nearest_strike(df, 'P', Kp_target, side='below')
     if kc_w_tuple is None or kp_w_tuple is None:
@@ -629,12 +619,9 @@ with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Li
         Kc_w, prem_cw, _ = kc_w_tuple
         Kp_w, prem_pw, _ = kp_w_tuple
 
-        cost_wings = 0.0
-        if not np.isnan(prem_cw): cost_wings += prem_cw
-        if not np.isnan(prem_pw): cost_wings += prem_pw
+        cost_wings = (0.0 if np.isnan(prem_cw) else prem_cw) + (0.0 if np.isnan(prem_pw) else prem_pw)
         credit_condor = cred_b - cost_wings
-        cost_jl = prem_cw if not np.isnan(prem_cw) else 0.0
-        credit_jl = cred_b - cost_jl
+        credit_jl = cred_b - (0.0 if np.isnan(prem_cw) else prem_cw)
 
         S_grid2 = np.linspace(max(0.01, Kp_w*0.8), Kc_w*1.2, 500)
         pay_str = payoff_arrays_strangle(S_grid2, Kp_b, Kc_b, cred_b)
@@ -667,31 +654,31 @@ with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Li
             plt.xlabel("Preço do ativo no vencimento (S)"); plt.ylabel("P/L por ação (R$)")
             st.pyplot(fig, use_container_width=True)
 
-        with st.expander("📘 Explicações, fórmulas e guia de gráfico"):
+        with st.expander("📘 Explicações, fórmulas e guia do gráfico"):
             st.markdown(f"""
 **Estruturas**  
-**Strangle vendido coberto** — Vende PUT (Kp={Kp_b:.2f}) + CALL (Kc={Kc_b:.2f}). Ganha o **crédito** se S ∈ [{Kp_b:.2f}, {Kc_b:.2f}].  
-**Iron Condor coberto** — Strangle + compra PUT (Kp_w={Kp_w:.2f}) e CALL (Kc_w={Kc_w:.2f}) de proteção (perda máxima limitada).  
-**Jade Lizard** — PUT vendida (Kp), CALL vendida (Kc) e CALL comprada (Kc_w). Se **crédito ≥ (Kc_w − Kc)**, não há **risco de alta**.
+- **Strangle vendido coberto** — Vende PUT (Kp={Kp_b:.2f}) + CALL (Kc={Kc_b:.2f}). Ganha o **crédito** se S ∈ [{Kp_b:.2f}, {Kc_b:.2f}].  
+- **Iron Condor coberto** — Strangle + compra PUT (Kp_w={Kp_w:.2f}) e CALL (Kc_w={Kc_w:.2f}) de proteção (perda máxima limitada).  
+- **Jade Lizard** — PUT vendida (Kp), CALL vendida (Kc) e CALL comprada (Kc_w). Se **crédito ≥ (Kc_w − Kc)**, não há **risco de alta**.
 
-**Fórmulas (por ação no vencimento)**  
-Strangle: Π(S) = −max(0, Kp − S) − max(0, S − Kc) + **crédito**.  
-Iron Condor: Π(S) = Strangle + max(0, Kp_w − S) + max(0, S − Kc_w) − **custo_das_asas**.  
-Jade Lizard: Π(S) = −max(0, Kp − S) − max(0, S − Kc) + max(0, S − Kc_w) + **crédito_líquido**.
+**Fórmulas do P/L (por ação, no vencimento)**  
+- Strangle: Π(S) = −max(0, Kp − S) − max(0, S − Kc) + **crédito**.  
+- Iron Condor: Π(S) = Strangle + max(0, Kp_w − S) + max(0, S − Kc_w) − **custo_das_asas**.  
+- Jade Lizard: Π(S) = −max(0, Kp − S) − max(0, S − Kc) + max(0, S − Kc_w) + **crédito_líquido**.
 
-**Probabilidade didática**  
-PoE_total ≈ PoE_put + PoE_call (limitado a 100%).  
-PoE_dentro = 1 − PoE_total. (Estimado por BS/delta quando IV faltar.)
+**Probabilidade (didática)**  
+PoE_total ≈ PoE_put + PoE_call (truncado em 100%).  
+PoE_dentro = 1 − PoE_total. (Estimado por BS/Δ quando IV faltar.)
 
 **Guia do gráfico**  
-• Linha horizontal 0 = **ponto de equilíbrio**.  
-• Linhas verticais pontilhadas = **strikes** (Kp, Kc) e, quando aplicável, **asas** (Kp_w, Kc_w).  
-• A curva mostra seu **P/L por ação** no vencimento para cada preço **S**.
+- Linha **0** (horizontal) = **ponto de equilíbrio**.  
+- Linhas pontilhadas = **strikes** (Kp, Kc) e, quando houver, **asas** (Kp_w, Kc_w).  
+- Curva = seu **P/L por ação** no vencimento para cada preço **S**.
 
 **Passo a passo**  
-1) Escolha o **ticker** e envie a **chain**.  
-2) Ajuste filtros (|Δ|, bandas) e cobertura (ações/caixa).  
-3) Veja o **Top 3** e a **tabela**.  
-4) Use a aba **Comparar estratégias** para decidir entre **Strangle**, **Condor** (risco limitado) ou **Jade Lizard** (proteção de alta).  
-5) Acompanhe as **instruções de saída** e encerre ao capturar sua **meta de prêmio**.
+1) Escolha o **ticker** e **envie a chain**.  
+2) Mapeie corretamente as **colunas** (principalmente **Vencimento**).  
+3) Ajuste **|Δ|**, **bandas**, **cobertura** (ações/caixa) e parâmetros de **saída**.  
+4) Avalie o **Top 3** e a **tabela**.  
+5) Compare **Strangle × Iron Condor × Jade Lizard** para decidir entre **crédito maior** vs **risco limitado**.
 """)
