@@ -120,9 +120,32 @@ def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=["symbol","type","strike"], how="any")
 
 def read_chain_from_uploaded(file) -> pd.DataFrame:
+    import io, pandas as pd
     name = file.name.lower()
+
+    # CSV primeiro (não precisa de dependência extra)
+    if name.endswith(".csv"):
+        data = file.read().decode("utf-8")
+        df = pd.read_csv(io.StringIO(data))
+        return normalize_chain_columns(df)
+
+    # Excel (xlsx/xls) – requer openpyxl (xlsx) ou xlrd (xls antigos)
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        xls = pd.ExcelFile(file)
+        try:
+            # Força engine openpyxl para .xlsx (mais comum)
+            if name.endswith(".xlsx"):
+                xls = pd.ExcelFile(file, engine="openpyxl")
+            else:
+                # .xls antigo – pandas moderno não lê sem engine; priorize converter para .xlsx
+                # Se quiser suportar .xls, instale também `xlrd==1.2.0` e use engine="xlrd"
+                xls = pd.ExcelFile(file)  # pode falhar; melhor converter para .xlsx
+        except Exception as e:
+            raise RuntimeError(
+                "Leitura de Excel requer dependência extra. "
+                "Para .xlsx, adicione `openpyxl` ao requirements.txt. "
+                "Alternativa rápida: exporte sua planilha para CSV e reenvie."
+            ) from e
+
         best_len, best_df = -1, None
         for sheet in xls.sheet_names:
             try:
@@ -134,10 +157,8 @@ def read_chain_from_uploaded(file) -> pd.DataFrame:
         if best_df is None:
             raise RuntimeError("Não foi possível ler nenhuma planilha válida do Excel.")
         return normalize_chain_columns(best_df)
-    else:
-        data = file.read().decode("utf-8")
-        df = pd.read_csv(io.StringIO(data))
-        return normalize_chain_columns(df)
+
+    raise RuntimeError("Formato não suportado. Envie um CSV ou Excel (.xlsx).")  
 
 @st.cache_data(show_spinner=False)
 def load_spot_and_iv_proxy(yahoo_ticker: str):
