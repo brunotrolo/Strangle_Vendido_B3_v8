@@ -14,16 +14,15 @@ import streamlit as st
 import yfinance as yf
 import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
-from requests_html import HTMLSession, AsyncHTMLSession
-import nest_asyncio
+from pyppeteer import launch
 
 # ============================================================
 # Config e título
 # ============================================================
 
-st.set_page_config(page_title="Strangle Vendido Coberto – v8 (JS render fix + loop)", layout="wide")
+st.set_page_config(page_title="Strangle Vendido Coberto – v8 (pyppeteer robusto)", layout="wide")
 st.title("💼 Strangle Vendido Coberto – Sugeridor (v8)")
-st.caption("Render JS estável no opções.net (corrigido o event loop do Streamlit) • Saídas automáticas • Ranking prêmio/risco • PoE • Top 3 • Catálogo B3")
+st.caption("Coleta do opções.net via Chromium headless (pyppeteer) com clique automático no botão de confirmação, mais fallbacks.")
 
 # ============================================================
 # Utils / Black–Scholes
@@ -204,44 +203,75 @@ def _choose_table_from_html(html_text: str) -> Optional[pd.DataFrame]:
         df = pd.read_html(io.StringIO(table_html), flavor="bs4", thousands=".", decimal=",", header=[0,1])[0]
     return _flatten_columns(df)
 
-# ------- NOVO: renderizador estável com event loop explícito -------
+# ------- NOVO: renderização com pyppeteer + clique no botão -------
 
-async def _fetch_render_async(url: str) -> str:
-    asess = AsyncHTMLSession()
-    r = await asess.get(url, headers=HEADERS, timeout=40)
-    # arender executa JS em Chromium headless (pyppeteer)
-    await r.html.arender(timeout=90, sleep=2)
-    return r.html.html
+async def _render_optionsnet_html(url: str) -> str:
+    browser = await launch(args=['--no-sandbox','--disable-setuid-sandbox'])
+    page = await browser.newPage()
+    await page.setExtraHTTPHeaders({"Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"})
+    await page.setUserAgent(HEADERS["User-Agent"])
+    await page.goto(url, waitUntil='networkidle2', timeout=90000)
 
-def render_with_event_loop(url: str) -> str:
-    """
-    Garante um event loop válido dentro da thread do Streamlit.
-    Usa nest_asyncio para permitir reentrância.
-    """
+    # Alguns tickers exigem clicar no botão "Continuar com dados de fechamento"
+    # Tentamos múltiplos seletores e estratégias por texto.
+    try:
+        # Espera até 2s e tenta clicar por data-action, id, texto ou role=button
+        # 1) por texto visível (querySelectorAll + innerText)
+        buttons = await page.querySelectorAll('button, a, input[type="button"], input[type="submit"]')
+        for b in buttons:
+            txt = (await (await b.getProperty('innerText')).jsonValue()) or ""
+            txt = str(txt).strip().lower()
+            if "continuar" in txt or "dados de fechamento" in txt:
+                await b.click()
+                await page.waitFor(1500)
+                break
+        # 2) fallback por seletor aproximado
+        for sel in ['#continuar', '.btn-continuar', 'button.btn-primary', 'button[type="submit"]']:
+            btn = await page.querySelector(sel)
+            if btn:
+                await btn.click()
+                await page.waitFor(1500)
+                break
+    except Exception:
+        pass
+
+    # Aguarda aparição de uma tabela com linhas (até 20s)
+    try:
+        await page.waitForSelector("table", timeout=20000)
+    except Exception:
+        pass
+
+    html = await page.content()
+    await browser.close()
+    return html
+
+def render_html_with_loop(url: str) -> str:
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-    # Permite reuse do loop na thread do ScriptRunner
-    nest_asyncio.apply()
-    return loop.run_until_complete(_fetch_render_async(url))
+    if loop.is_running():
+        # raro em Streamlit, mas evitamos conflito
+        coro = _render_optionsnet_html(url)
+        return asyncio.run(coro)
+    return loop.run_until_complete(_render_optionsnet_html(url))
 
 @st.cache_data(show_spinner=False)
 def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
     ticker_base = ticker_url.rsplit("/", 1)[-1].strip().upper()
     url = f"https://opcoes.net.br/opcoes/bovespa/{ticker_base}"
 
-    # 1) Renderização JS com loop explícito
+    # 1) pyppeteer com clique automático, aguardando tabela
     try:
-        html = render_with_event_loop(url)
+        html = render_html_with_loop(url)
         df = _choose_table_from_html(html)
         if df is not None and not df.empty:
             return normalize_chain_columns(df)
-    except Exception as e:
-        pass  # tenta fallbacks abaixo
+    except Exception:
+        pass
 
-    # 2) Fallback: HTML bruto sem render
+    # 2) HTML bruto sem render
     try:
         r = requests.get(url, headers=HEADERS, timeout=40)
         tables = pd.read_html(r.text)
@@ -413,13 +443,11 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     yahoo_ticker = tk if tk.endswith(".SA") else f"{tk}.SA"
     spot, hv20, iv_series = load_spot_and_iv_proxy(yahoo_ticker)
 
-    # cabeçalho de métricas
     m1, m2, m3 = st.columns(3)
     with m1: st.metric("Preço à vista (S)", f"{spot:,.2f}" if not np.isnan(spot) else "—")
     with m2: st.metric("HV20 (σ anual – proxy)", f"{hv20:.2%}" if not np.isnan(hv20) else "—")
     with m3: st.metric("r (anual)", f"{selic_input:.2%}")
 
-    # fonte (options.net) e chain
     url = optionsnet_url_from_ticker(tk)
     st.write(f"🔗 **Fonte**: {url}")
 
@@ -433,7 +461,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         st.warning("Nenhuma linha válida retornada.")
         return None
 
-    # mid e IV efetiva
     if "bid" in chain.columns and "ask" in chain.columns and chain["bid"].notna().any() and chain["ask"].notna().any():
         chain["mid"] = (chain["bid"].fillna(0) + chain["ask"].fillna(0)) / 2.0
     else:
@@ -448,7 +475,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     if chain["iv_eff"].isna().all():
         chain["iv_eff"] = hv20
 
-    # vencimentos
     expirations = sorted([d for d in chain["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))], key=lambda x: x)
     if not expirations:
         st.error("Nenhum vencimento válido encontrado.")
@@ -466,14 +492,12 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         st.warning("Nenhuma opção para o vencimento escolhido.")
         return None
 
-    # IV Rank / Percentil (proxy)
     iv_now, iv_rank, iv_pct = compute_iv_rank_percentile(iv_series, int(lookback_days))
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("IV atual (proxy)", f"{iv_now:.2%}" if not np.isnan(iv_now) else "—")
     with c2: st.metric("IV Rank", f"{iv_rank:.0%}" if not np.isnan(iv_rank) else "—")
     with c3: st.metric("IV Percentil", f"{iv_pct:.0%}" if not np.isnan(iv_pct) else "—")
 
-    # Separa calls/puts OTM
     calls = chain[(chain["type"] == "C") & (chain["strike"] >= 0)].copy()
     puts  = chain[(chain["type"] == "P") & (chain["strike"] >= 0)].copy()
     calls["OTM"] = calls["strike"] > spot
@@ -481,7 +505,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     calls = calls[calls["OTM"]]
     puts  = puts[puts["OTM"]]
 
-    # garante delta
     for side_df, side in [(calls,"C"), (puts,"P")]:
         if "delta" not in side_df.columns:
             side_df["delta"] = np.nan
@@ -496,7 +519,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
                 calc.append(d)
             side_df.loc[need, "delta"] = calc
 
-    # filtro por |Δ|
     def apply_delta_filter(df: pd.DataFrame) -> pd.DataFrame:
         if (delta_min <= 0 and delta_max <= 0) or "delta" not in df.columns:
             return df
@@ -511,7 +533,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     calls = apply_delta_filter(calls)
     puts  = apply_delta_filter(puts)
 
-    # ProbITM por perna (N(d2), fallback |Δ|)
     def compute_probs(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         df_side = df_side.copy()
         probs = []
@@ -529,7 +550,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     calls = compute_probs(calls, "C")
     puts  = compute_probs(puts,  "P")
 
-    # Cobertura e bandas
     max_qty_call = (shares_owned // lot_size) if lot_size > 0 else 0
     def max_qty_put_for_strike(K_put: float) -> int:
         if lot_size <= 0 or K_put <= 0:
@@ -554,7 +574,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         st.warning("Sem CALLs/PUTs OTM dentro dos filtros/risco. Ajuste |Δ|/bandas.")
         return None
 
-    # Combinações e ranking
     def combine_strangles(calls: pd.DataFrame, puts: pd.DataFrame) -> pd.DataFrame:
         combos: List[dict] = []
         for _, c in calls.iterrows():
@@ -750,9 +769,12 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
 
 with st.sidebar:
     st.markdown("---")
-    st.markdown("**Requisitos extras para coleta JS:** `requests-html`, `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`, `nest_asyncio`")
+    st.markdown("**Requisitos para coleta JS (Chromium):** `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`  \nSe rodar em container/Cloud, garanta suporte a headless Chrome.")
 
-tabs = st.tabs(tickers)
+tabs = st.tabs(tickers if 'tickers' in globals() else ["PETR4.SA"])
+
+if 'tickers' not in globals():
+    tickers = ["PETR4.SA"]
 
 all_results = []
 for tk, tab in zip(tickers, tabs):
