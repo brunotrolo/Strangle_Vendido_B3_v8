@@ -5,17 +5,6 @@
 # - Tooltips (help=) em TODOS os controles da barra lateral
 # - Sugestões de strangle + saídas didáticas
 # - Aba "📈 Comparar estratégias" (Strangle × Iron Condor × Jade Lizard)
-#
-# Requisitos (requirements.txt):
-# streamlit
-# pandas
-# numpy
-# matplotlib
-# requests
-# beautifulsoup4
-# lxml
-# yfinance
-# openpyxl
 
 import io
 import re
@@ -268,6 +257,7 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
     Lê .xlsx/.csv do opcoes.net com detecção automática de cabeçalho:
     - tenta header=1 (linha 2) *e* header=0 (linha 1)
     - normaliza nomes de colunas e mapeia aliases automaticamente
+    - CALCULA MID de forma robusta (sem .fillna() em float)
     """
     name = file.name.lower()
     file_bytes = file.getvalue()  # lê uma vez
@@ -285,6 +275,8 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
             _df = try_read(h)
             if _df is not None and _df.shape[1] >= 3:
                 df = _df
+            # quebra só se conseguiu algo minimamente válido
+            if df is not None:
                 break
         except Exception:
             continue
@@ -335,8 +327,10 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
                     return orig
         return None
 
-    out = pd.DataFrame()
+    # --- DataFrame de saída deve ter o MESMO ÍNDICE da planilha ---
+    out = pd.DataFrame(index=df.index)
 
+    # Colunas principais
     col_symbol = find_col(aliases["symbol"])
     if col_symbol is not None:
         out["symbol"] = df[col_symbol]
@@ -379,11 +373,18 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
     col_strike = find_col(aliases["strike"])
     out["strike"] = pd.to_numeric(df[col_strike].map(_br_to_float), errors="coerce") if col_strike else np.nan
 
-    # preços
-    for fld, key in [("bid","bid"), ("ask","ask"), ("last","last")]:
-        col = find_col(aliases.get(key, []))
-        if col is not None:
-            out[fld] = pd.to_numeric(df[col].map(_br_to_float), errors="coerce")
+    # preços (cada série alinhada ao índice)
+    col_bid = find_col(aliases["bid"])
+    if col_bid is not None:
+        out["bid"] = pd.to_numeric(df[col_bid].map(_br_to_float), errors="coerce")
+
+    col_ask = find_col(aliases["ask"])
+    if col_ask is not None:
+        out["ask"] = pd.to_numeric(df[col_ask].map(_br_to_float), errors="coerce")
+
+    col_last = find_col(aliases["last"])
+    if col_last is not None:
+        out["last"] = pd.to_numeric(df[col_last].map(_br_to_float), errors="coerce")
 
     # IV / Delta
     col_iv = find_col(aliases["impliedVol"])
@@ -393,11 +394,15 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
     if col_delta is not None:
         out["delta"] = pd.to_numeric(df[col_delta].map(_br_to_float), errors="coerce")
 
-    # mid
-    if "bid" in out.columns and "ask" in out.columns and (out["bid"].notna().any() or out["ask"].notna().any()):
-        out["mid"] = (out["bid"].fillna(0) + out["ask"].fillna(0)) / 2.0
-    else:
-        out["mid"] = out.get("last", np.nan).fillna(0)
+    # --- MID robusto (funciona mesmo sem bid/ask/last) ---
+    bid_series  = out["bid"]  if "bid"  in out.columns else pd.Series(np.nan, index=df.index)
+    ask_series  = out["ask"]  if "ask"  in out.columns else pd.Series(np.nan, index=df.index)
+    last_series = out["last"] if "last" in out.columns else pd.Series(np.nan, index=df.index)
+
+    has_quote = bid_series.notna() | ask_series.notna()
+    mid_from_quotes = (bid_series.fillna(0) + ask_series.fillna(0)) / 2.0
+
+    out["mid"] = np.where(has_quote, mid_from_quotes, last_series)
 
     # IV efetiva placeholder (fallback real via HV20 ocorre depois)
     if "impliedVol" not in out.columns:
@@ -459,7 +464,9 @@ def dfilter(dfi: pd.DataFrame) -> pd.DataFrame:
     if "delta" not in dfi.columns: return dfi
     dfo = dfi.copy(); dfo["abs_delta"] = dfo["delta"].abs()
     if delta_min>0: dfo = dfo[dfo["abs_delta"]>=delta_min]
-    if delta_max>0: dfo = dfo[dfo["abs_delta"]<=delta_max]
+    if delta_max>0: dfo = dfo[dfi["abs_delta"]<=delta_max] if "abs_delta" in dfo.columns else dfo
+    if "abs_delta" in dfo.columns:
+        dfo = dfo[(dfo["abs_delta"]>=delta_min) & (dfo["abs_delta"]<=delta_max)]
     return dfo
 
 calls = dfilter(calls); puts = dfilter(puts)
