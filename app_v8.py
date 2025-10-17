@@ -776,7 +776,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Requisitos para coleta JS (Chromium):** `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`  \nSe rodar em container/Cloud, garanta suporte a headless Chrome.")
 
-tabs = st.tabs(tickers if tickers else ['PETR4.SA']) else ["PETR4.SA"])
+tabs = st.tabs(tickers if tickers else ['PETR4.SA'])
 
 if 'tickers' not in globals():
     tickers = ["PETR4.SA"]
