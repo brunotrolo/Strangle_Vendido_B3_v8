@@ -11,3 +11,4 @@ pyppeteer
 bs4
 lxml
 lxml_html_clean
+nest_asyncio
