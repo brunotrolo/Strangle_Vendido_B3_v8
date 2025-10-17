@@ -1,12 +1,9 @@
 # app_v9_paste_only.py
 # v9 — Somente "copiar e colar" do opcoes.net (sem upload)
-# - Pega tabela colada (HTML, CSV/TSV ou texto tabular)
-# - Normaliza colunas PT-BR automaticamente
-# - Usa Yahoo Finance para S (spot) e HV20
-# - Monta e ranqueia strangles cobertos
-# - Se vencimento escolhido não tiver os dois lados (CALL/PUT OTM), tenta automaticamente o vencimento válido mais próximo
-# - Comparador: Strangle × Iron Condor × Jade Lizard
-# - Ajuda didática nas ferramentas (tooltips) e regras de saída
+# Correções importantes:
+#  - Normalização de 'type': se vier A/E (ou qualquer coisa ≠ CALL/PUT), zera p/ NaN e aplica heurística (strike vs spot)
+#  - Modo diagnóstico avançado: escondido por padrão (toggle)
+#  - Mantém comparador (Strangle × Iron Condor × Jade Lizard) e regras didáticas
 
 import io, re, unicodedata, math
 from datetime import date, datetime, timedelta
@@ -159,7 +156,6 @@ def fetch_b3_tickers():
                 tk = m.group(1)
                 nm = a.get_text(strip=True) or tk
                 tickers.append((tk, nm))
-    # remover duplicatas preservando nome
     return sorted({tk: nm for tk, nm in tickers}.items(), key=lambda x: x[0])
 
 tickers_list = fetch_b3_tickers()
@@ -202,6 +198,8 @@ with st.sidebar:
                                help="Marca strike ‘ameaçado’ quando S está a menos de X% dele.") / 100.0
     capture_target = st.number_input("Meta de captura do prêmio (%)", 10, 95, 70,
                                      help="Encerrar com ganho parcial (ex.: 70% capturado).") / 100.0
+    st.markdown("---")
+    ADV = st.toggle("🔬 Mostrar diagnóstico avançado", value=False)
 
 # -------------------- Spot/HV20 --------------------
 @st.cache_data(show_spinner=False)
@@ -281,6 +279,7 @@ if not raw_text.strip():
 try:
     df_raw = read_pasted_table(raw_text)
     st.success(f"Tabela colada reconhecida com {df_raw.shape[0]} linhas × {df_raw.shape[1]} colunas.")
+    if ADV: st.dataframe(df_raw.head())
 except Exception as e:
     st.error(f"Não consegui entender o texto colado: {e}")
     st.stop()
@@ -317,33 +316,31 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     c_type = find_col(aliases["type"])
     if c_type is not None:
         tnorm = df[c_type].astype(str).str.upper().str.strip()
-        out["type"] = tnorm.replace({"CALL":"C","COMPRA":"C","C":"C","PUT":"P","VENDA":"P","P":"P"})
+        # Mapeia CALL/PUT; qualquer outro valor vira NaN (para acionar heurística)
+        mapped = tnorm.replace({"CALL":"C","COMPRA":"C","C":"C","PUT":"P","VENDA":"P","P":"P"})
+        mapped = mapped.where(mapped.isin(["C","P"]), np.nan)
+        out["type"] = mapped
     else:
         out["type"] = np.nan
 
-    # fallback do tipo pelo código (letra da série)
-    if out["type"].isna().all() and "symbol" in out.columns:
-        def infer_from_symbol(code: str):
-            if not isinstance(code, str): return np.nan
-            s = re.sub(r'[^A-Z0-9]', '', code.upper())
-            m = re.search(r'([A-Z])\d+$', s)
-            if not m: return np.nan
-            letra = m.group(1)
-            if letra in CALL_SERIES: return 'C'
-            if letra in PUT_SERIES:  return 'P'
-            return np.nan
-        out["type"] = out["symbol"].map(infer_from_symbol)
+    # fallback do tipo pelo código (letra da série), se ainda estiver NaN
+    if ("type" not in out.columns) or out["type"].isna().all():
+        if "symbol" in out.columns:
+            def infer_from_symbol(code: str):
+                if not isinstance(code, str): return np.nan
+                s = re.sub(r'[^A-Z0-9]', '', code.upper())
+                m = re.search(r'([A-Z])\d+$', s)
+                if not m: return np.nan
+                letra = m.group(1)
+                if letra in CALL_SERIES: return 'C'
+                if letra in PUT_SERIES:  return 'P'
+                return np.nan
+            out["type"] = out.get("type", pd.Series(np.nan, index=out.index))
+            out["type"] = out["type"].fillna(out["symbol"].map(infer_from_symbol))
 
     # strike
     c_strike = find_col(aliases["strike"])
-    if c_strike:
-        raw = df[c_strike]
-        strike_parsed = pd.to_numeric(raw.map(_br_to_float), errors="coerce")
-        if strike_parsed.notna().sum() == 0:
-            strike_parsed = pd.to_numeric(raw, errors="coerce")
-        out["strike"] = strike_parsed
-    else:
-        out["strike"] = np.nan
+    out["strike"] = pd.to_numeric(df[c_strike].map(_br_to_float), errors="coerce") if c_strike else np.nan
 
     # preços → mid
     c_bid = find_col(aliases["bid"])
@@ -358,7 +355,7 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     has_quote = bid.notna() | ask.notna()
     out["mid"] = np.where(has_quote, (bid.fillna(0)+ask.fillna(0))/2.0, last)
 
-    # IV / Δ
+    # IV / Δ originais (se vierem)
     c_iv = find_col(aliases["impliedVol"])
     if c_iv is not None:
         out["impliedVol"] = pd.to_numeric(df[c_iv].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
@@ -377,25 +374,23 @@ def normalize_opcoesnet_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["expiration"] = np.nan
 
-    # completa essenciais
-    for col in ["type","strike","mid","expiration"]:
-        if col not in out.columns: out[col] = np.nan
-
-    with st.expander("🛠️ Diagnóstico de leitura"):
-        st.write("Colunas padronizadas:", list(out.columns))
-        if "type" in out.columns:
-            st.write("Contagem por tipo:", out["type"].value_counts(dropna=False))
-        if "strike" in out.columns:
-            ex = out["strike"].dropna().astype(float)
-            st.write("Qtde de strikes válidos:", int(ex.shape[0]))
-            st.write("Exemplo strikes:", ex.head(10).tolist())
-        if "expiration" in out.columns:
-            st.write("Exemplo vencimentos:", out["expiration"].dropna().astype(str).head(5).tolist())
+    # diagnóstico opcional
+    if ADV:
+        with st.expander("🛠️ Diagnóstico de leitura"):
+            st.write("Colunas padronizadas:", list(out.columns))
+            if "type" in out.columns:
+                st.write("Contagem por tipo:", out["type"].value_counts(dropna=False))
+            if "strike" in out.columns:
+                ex = out["strike"].dropna().astype(float)
+                st.write("Qtde de strikes válidos:", int(ex.shape[0]))
+                st.write("Exemplo strikes:", ex.head(10).tolist())
+            if "expiration" in out.columns:
+                st.write("Exemplo vencimentos:", out["expiration"].dropna().astype(str).head(5).tolist())
     return out
 
 chain_all = normalize_opcoesnet_df(df_raw)
 
-# -------------------- Escolha de vencimento (com fallback automático) --------------------
+# -------------------- Escolha de vencimento --------------------
 valid_exps = sorted([d if isinstance(d, date) else (d.date() if isinstance(d, datetime) else None)
                      for d in chain_all["expiration"].dropna().unique().tolist()])
 valid_exps = [d for d in valid_exps if isinstance(d, date)]
@@ -404,24 +399,27 @@ if not valid_exps:
     st.stop()
 
 st.markdown("#### 📅 Vencimento")
-exp_choice = st.selectbox("Escolha um vencimento (se não houver CALL e PUT OTM, o app tentará outro automaticamente):",
-                          options=valid_exps, index=0)
+exp_choice = st.selectbox("Escolha um vencimento:", options=valid_exps, index=0)
 
-def build_chain_for_exp(exp_date: date):
-    df = chain_all[chain_all["expiration"] == exp_date].copy()
-    return df
+def yearfrac_days(to_date: date):
+    return yearfrac(date.today(), to_date), (to_date - date.today()).days
 
-# -------------------- Completa IV/Δ e types --------------------
+# -------------------- Enriquecimento (Δ/IV) com HEURÍSTICA sempre que preciso --------------------
 def enrich_chain(df: pd.DataFrame, spot: float, r: float, hv20: float, exp_date: date):
-    T = yearfrac(date.today(), exp_date)
+    T, _ = yearfrac_days(exp_date)
     df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
 
-    # tipo por heurística se faltar
-    if "type" not in df.columns or df["type"].isna().all():
-        guess = pd.Series(None, index=df.index, dtype="object")
+    # Se 'type' tiver valores que NÃO são C/P, zera p/ NaN (força heurística)
+    if "type" in df.columns:
+        df.loc[~df["type"].isin(["C","P"]), "type"] = np.nan
+
+    # Heurística se faltar C/P (ou parte deles)
+    need_type = df["type"].isna() if "type" in df.columns else pd.Series(True, index=df.index)
+    if need_type.any():
+        guess = pd.Series(np.nan, index=df.index, dtype="object")
         guess.loc[(df["strike"] > spot)] = "C"
         guess.loc[(df["strike"] < spot)] = "P"
-        df["type"] = guess
+        df["type"] = df.get("type", guess).fillna(guess)
 
     # IV efetiva
     if "impliedVol" not in df.columns:
@@ -430,7 +428,7 @@ def enrich_chain(df: pd.DataFrame, spot: float, r: float, hv20: float, exp_date:
     if df["iv_eff"].isna().all() or (df["iv_eff"]<=0).all():
         df["iv_eff"] = hv20
 
-    # Delta: calcula se faltar
+    # Delta: calcula se faltar (agora com 'type' garantido como C/P)
     if "delta" not in df.columns:
         df["delta"] = np.nan
     need = df["delta"].isna()
@@ -452,37 +450,38 @@ def enrich_chain(df: pd.DataFrame, spot: float, r: float, hv20: float, exp_date:
 
     return df, T
 
+# -------------------- Filtros de lado --------------------
 def side_filters(df: pd.DataFrame, spot: float, delta_min: float, delta_max: float):
-    # OTM definiton + filtro de delta
     calls = df[(df["strike"]>spot)].copy()
     puts  = df[(df["strike"]<spot)].copy()
-    # respeita 'type' quando existir
+    # respeita 'type' se existir
     if "type" in df.columns:
-        calls = calls[(calls["type"]=="C") | (calls["type"].isna())]
-        puts  = puts[(puts["type"]=="P") | (puts["type"].isna())]
-    # delta window
+        calls = calls[calls["type"]=="C"]
+        puts  = puts[puts["type"]=="P"]
+    # Janela de delta
     for dfx in (calls, puts):
         if "delta" in dfx.columns:
             dfx["abs_delta"] = dfx["delta"].abs()
-            dfx.dropna(subset=["abs_delta"], inplace=True)
             dfx = dfx[(dfx["abs_delta"]>=delta_min) & (dfx["abs_delta"]<=delta_max)]
-        # preço
+        # preço disponível
         if "mid" in dfx.columns:
-            dfx.dropna(subset=["mid"], inplace=True)
+            dfx = dfx[dfx["mid"].notna()]
         yield dfx
 
+# -------------------- Montagem --------------------
 def try_strangles_for_exp(df_exp: pd.DataFrame, spot: float, r: float, hv20: float, exp_date: date,
                           delta_min: float, delta_max: float, shares_owned: int, cash_available: float, lot_size: int):
     dfE, T = enrich_chain(df_exp.copy(), spot, r, hv20, exp_date)
-
     calls, puts = list(side_filters(dfE, spot, delta_min, delta_max))
-    with st.expander("🔎 Diagnóstico de filtros (OTM)"):
-        st.write(f"Vencimento: {exp_date} | Calls OTM: {len(calls)} | Puts OTM: {len(puts)}")
-        if not calls.empty: st.write("Exemplo calls:", calls[["strike","mid","delta"]].head())
-        if not puts.empty:  st.write("Exemplo puts:",  puts[["strike","mid","delta"]].head())
+
+    if ADV:
+        with st.expander(f"🔎 Diagnóstico de filtros (OTM) — {exp_date}"):
+            st.write(f"Calls OTM: {len(calls)} | Puts OTM: {len(puts)}")
+            if not calls.empty: st.write("Exemplo calls:", calls[["strike","mid","delta"]].head())
+            if not puts.empty:  st.write("Exemplo puts:",  puts[["strike","mid","delta"]].head())
 
     if calls.empty or puts.empty:
-        return pd.DataFrame()  # não dá para montar strangle
+        return pd.DataFrame()
 
     max_qty_call = (shares_owned // lot_size) if lot_size > 0 else 0
     def max_qty_put_for_strike(Kp: float) -> int:
@@ -546,12 +545,14 @@ with colC:
                                help="Na B3, normalmente 100.")
 
 # -------------------- Montagem + fallback de vencimento --------------------
-try_order = [exp_choice] + [d for d in valid_exps if d != exp_choice]  # tenta o escolhido primeiro
+chain_all = chain_all.copy()
+valid_exps_sorted = sorted(valid_exps)
+try_order = [exp_choice] + [d for d in valid_exps_sorted if d != exp_choice]  # tenta o escolhido primeiro
 combo_df = pd.DataFrame()
 used_exp = None
 for e in try_order:
     tmp = try_strangles_for_exp(
-        build_chain_for_exp(e), spot, r, hv20, e,
+        chain_all[chain_all["expiration"]==e], spot, r, hv20, e,
         delta_min, delta_max, shares_owned, cash_available, lot_size
     )
     if not tmp.empty:
@@ -560,8 +561,10 @@ for e in try_order:
         break
 
 if combo_df.empty:
-    st.warning("Não há strangles possíveis com os filtros/limites atuais **em nenhum vencimento** desta cadeia colada.\n\n"
-               "Dicas: aumente |Δ| máximo, verifique se ‘Último’ (ou Bid/Ask) está preenchido, ou cole uma cadeia mais completa.")
+    st.warning(
+        "Não há strangles possíveis com os filtros/limites atuais **em nenhum vencimento** desta cadeia colada.\n\n"
+        "Dicas: aumente |Δ| máximo, verifique se ‘Último’ (ou Bid/Ask) está preenchido, ou cole uma cadeia mais completa."
+    )
     st.stop()
 
 if used_exp != exp_choice:
@@ -667,8 +670,7 @@ with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Li
 
     wing_pct = st.slider("Largura das asas (% do preço à vista)", 2, 15, 5, 1,
                          help="Distância das asas (PUT comprada e CALL comprada) do strangle base.") / 100.0
-    # usar a chain do vencimento efetivamente usado (used_exp)
-    df_used = build_chain_for_exp(rowb["expiration"])
+    df_used = chain_all[chain_all["expiration"]==rowb["expiration"]].copy()
     df_used, _ = enrich_chain(df_used, spot, r, hv20, rowb["expiration"])
 
     Kc_target = Kc_b + wing_pct * spot
