@@ -6,3 +6,8 @@ matplotlib>=3.8.4
 requests>=2.31.0
 lxml>=5.2.1
 html5lib>=1.1
+requests-html
+pyppeteer
+bs4
+lxml
+lxml_html_clean
