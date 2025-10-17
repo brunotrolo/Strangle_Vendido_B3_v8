@@ -1,4 +1,3 @@
-
 # app_v9_fileinput.py
 # Strangle Vendido Coberto — v9 (fonte: arquivo CSV/XLSX)
 # Mantém: sugestões de strangle, instruções de saída, comparação (Strangle × Iron Condor × Jade Lizard)
@@ -202,6 +201,7 @@ except Exception as e:
     st.error(f"Falha ao ler o arquivo: {e}")
     st.stop()
 
+# tenta inferir os tickers-base a partir do prefixo dos símbolos das opções
 tickers_in_file = sorted(list(set([re.sub(r'\d+$','', str(s)[:5]).upper() if isinstance(s,str) else '' for s in chain_all.get('symbol', [])])))
 tickers_in_file = [t for t in tickers_in_file if re.match(r'^[A-Z]{4,5}$', t)]
 if not tickers_in_file:
@@ -384,13 +384,12 @@ def pipeline_for_ticker(tk_base: str):
         msg.append(f"🔧 Zeragem total (~): R$ {target_debit_both:.2f}/ação. Perna: ~ R$ {target_debit_per_leg:.2f}/ação.")
         return "  \n".join(msg), ("⚠️" if (time_critical and (near_call or near_put)) else "✅")
 
-    if True:
-        exit_texts, alerts = [], []
-        for _, rrow in combo_df.iterrows():
-            text, alert = build_exit_guidance(rrow)
-            exit_texts.append(text); alerts.append(alert)
-        combo_df["Instrucao_saida"] = exit_texts
-        combo_df["Alerta_saida"] = alerts
+    exit_texts, alerts = [], []
+    for _, rrow in combo_df.iterrows():
+        text, alert = build_exit_guidance(rrow)
+        exit_texts.append(text); alerts.append(alert)
+    combo_df["Instrucao_saida"] = exit_texts
+    combo_df["Alerta_saida"] = alerts
 
     st.session_state.setdefault("v9_ctx", {})
     st.session_state["v9_ctx"][tk_base] = {
@@ -449,9 +448,11 @@ def pipeline_for_ticker(tk_base: str):
         width='stretch'
     )
 
+    # ---- Comparador de estratégias (v9)
     with st.expander("📈 Comparar estratégias (v9)"):
         render_compare_tab(tk_base, result)
 
+    # ---- Payoff simples
     st.markdown("### 📈 Payoff no Vencimento (P/L por ação)")
     result["id"] = (result.get("Risco","") + " | " + result["call_symbol"].astype(str) + " & " +
                     result["put_symbol"].astype(str) + " | Kc=" + result["K_call"].round(2).astype(str) +
@@ -470,6 +471,7 @@ def pipeline_for_ticker(tk_base: str):
 
     return result
 
+# -------- v9: comparação ---------
 def _nearest_strike(df, typ, target, side):
     d = df[df["type"]==typ].copy()
     if d.empty: return None
@@ -568,7 +570,7 @@ def render_compare_tab(tk, combos_df):
         st.pyplot(fig, width='stretch')
 
     with st.expander("📘 Explicações didáticas"):
-        st.markdown(f\"\"\"
+        st.markdown(f"""
 **Strangle vendido coberto** — Vende PUT (Kp={Kp:.2f}) + CALL (Kc={Kc:.2f}).  
 Ganha o crédito se S ∈ [{Kp:.2f}, {Kc:.2f}]. Risco em extremos.
 
@@ -577,7 +579,7 @@ Limita perdas; crédito menor; mesma zona neutra.
 
 **Jade Lizard** — Vende PUT (Kp) + CALL (Kc) e compra CALL (Kc_w).  
 Se crédito ≥ (Kc_w − Kc), não há risco de alta (ganho limitado ao crédito).
-\"\"\")
+""")
 
 for tk, tab in zip(tickers_in_file, tabs):
     with tab:
