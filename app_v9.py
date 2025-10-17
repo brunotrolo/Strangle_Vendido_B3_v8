@@ -1,14 +1,25 @@
 # app_v9_b3_file.py
 # v9 didático (1 ticker por vez) com:
 # - Lista B3 (Dados de Mercado)
-# - Upload da chain (Excel/CSV)
+# - Upload da chain (Excel/CSV do opcoes.net) com DETECÇÃO AUTOMÁTICA de cabeçalho (linha 2 OU linha 1)
 # - Tooltips (help=) em TODOS os controles da barra lateral
-# - Mapeamento manual de colunas (inclui Vencimento)
 # - Sugestões de strangle + saídas didáticas
 # - Aba "📈 Comparar estratégias" (Strangle × Iron Condor × Jade Lizard)
+#
+# Requisitos (requirements.txt):
+# streamlit
+# pandas
+# numpy
+# matplotlib
+# requests
+# beautifulsoup4
+# lxml
+# yfinance
+# openpyxl
 
 import io
 import re
+import unicodedata
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -18,6 +29,7 @@ import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
+from pandas.tseries.offsets import BDay
 
 # -------------------------------
 # Configuração
@@ -29,7 +41,7 @@ st.set_page_config(
 )
 
 st.title("💼 Strangle Vendido Coberto — v9 (B3 + arquivo)")
-st.caption("Escolha um ticker da B3, mapeie as colunas do seu arquivo, gere sugestões e compare Strangle × Iron Condor × Jade Lizard.")
+st.caption("Escolha um ticker da B3, envie a planilha do opções.net (.xlsx/.csv) e receba sugestões + comparação (Strangle × Iron Condor × Jade Lizard).")
 
 # -------------------------------
 # Utilidades
@@ -37,6 +49,10 @@ st.caption("Escolha um ticker da B3, mapeie as colunas do seu arquivo, gere suge
 CALL_SERIES = set(list("ABCDEFGHIJKL"))
 PUT_SERIES  = set(list("MNOPQRSTUVWX"))
 SQRT_2 = np.sqrt(2.0)
+
+def _strip_accents(s: str) -> str:
+    if not isinstance(s, str): return s
+    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
 
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + np.math.erf(x / SQRT_2))
@@ -82,11 +98,10 @@ def _br_to_float(x):
     except: return np.nan
 
 def _excel_serial_to_date(n):
-    # Excel: 1 => 1899-12-31, mas há bug do 1900 (pandas usa 1899-12-30)
     try:
         n = float(n)
         if n <= 0: return np.nan
-        base = datetime(1899, 12, 30)
+        base = datetime(1899, 12, 30)  # pandas/Excel epoch (com bug do 1900)
         return (base + timedelta(days=int(n))).date()
     except Exception:
         return np.nan
@@ -95,12 +110,10 @@ def _parse_date_any(x):
     if pd.isna(x): return np.nan
     if isinstance(x, (pd.Timestamp, datetime)): return x.date()
     if isinstance(x, date): return x
-    # Se vier número do Excel
     if isinstance(x, (int, float)) and not np.isnan(x):
         d = _excel_serial_to_date(x)
         if isinstance(d, date): return d
     s = str(x).strip()
-    # dd/mm/aaaa etc.
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -125,7 +138,6 @@ def fetch_b3_tickers():
         return []
     soup = BeautifulSoup(resp.text, "lxml")
     tickers = []
-    # Tabela principal
     for tb in soup.find_all("table"):
         head = tb.find("thead")
         if not head: continue
@@ -141,7 +153,6 @@ def fetch_b3_tickers():
                 if re.match(r"^[A-Z]{4}\d$", tk):
                     tickers.append((tk, nm))
             break
-    # Fallback por links
     if not tickers:
         for a in soup.find_all("a", href=True):
             m = re.match(r"^/acoes/([A-Z]{4}\d)$", a["href"])
@@ -241,127 +252,188 @@ if np.isnan(spot) or spot <= 0:
     st.stop()
 
 # -------------------------------
-# Upload e mapeamento de colunas
+# Upload (opcoes.net) — leitura automática (header 2 OU 1)
 # -------------------------------
-st.markdown(f"### 3) Envie a *option chain* (Excel/CSV) para **{TICKER}**")
+st.markdown(f"### 3) Envie a *option chain* do **opcoes.net** (Excel/CSV) para **{TICKER}**")
 uploaded = st.file_uploader(
-    "Mapeie as colunas logo abaixo. Aceita: Símbolo/Código, Vencimento, Tipo C/P, Strike, Bid/Ask/Último, Delta, IV.",
+    "Detecção automática do cabeçalho: tenta linha 2 (header=1) e linha 1 (header=0).",
     type=["xlsx","xls","csv"]
 )
 if uploaded is None:
     st.info("👉 Envie o arquivo para continuar.")
     st.stop()
 
-def read_raw(file) -> pd.DataFrame:
+def _auto_read_opcoesnet(file) -> pd.DataFrame:
+    """
+    Lê .xlsx/.csv do opcoes.net com detecção automática de cabeçalho:
+    - tenta header=1 (linha 2) *e* header=0 (linha 1)
+    - normaliza nomes de colunas e mapeia aliases automaticamente
+    """
     name = file.name.lower()
-    if name.endswith(".csv"):
-        data = file.read().decode("utf-8", errors="ignore")
-        return pd.read_csv(io.StringIO(data))
-    else:
+    file_bytes = file.getvalue()  # lê uma vez
+
+    def try_read(header):
+        if name.endswith(".csv"):
+            text = file_bytes.decode("utf-8", errors="ignore")
+            return pd.read_csv(io.StringIO(text), header=header)
+        else:
+            return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl", header=header)
+
+    df = None
+    for h in (1, 0):  # primeiro o padrão antigo (linha 2), depois linha 1
         try:
-            xls = pd.ExcelFile(file, engine="openpyxl")
+            _df = try_read(h)
+            if _df is not None and _df.shape[1] >= 3:
+                df = _df
+                break
         except Exception:
-            raise RuntimeError("Para .xlsx, adicione `openpyxl` no requirements. Alternativa: exporte a planilha para CSV.")
-        best_len, best_df = -1, None
-        for sheet in xls.sheet_names:
+            continue
+
+    if df is None:
+        raise RuntimeError("Falha ao ler a planilha: tente exportar novamente em .xlsx ou .csv.")
+
+    # Limpeza básica
+    df = df.dropna(how="all").copy()
+
+    # Normaliza nomes (original -> normalizado)
+    def _clean_cols(cols):
+        out = []
+        for c in cols:
+            c0 = str(c).strip()
+            c1 = re.sub(r'\s+', ' ', c0)
+            c2 = _strip_accents(c1).lower()
+            out.append((c0, c2))
+        return out
+
+    norm_pairs = _clean_cols(df.columns)
+    rev_map  = {norm: orig for orig, norm in norm_pairs}
+
+    # Aliases tolerantes
+    aliases = {
+        "symbol": ["ticker", "codigo", "código", "opcao", "opção", "símbolo", "simbolo"],
+        "expiration": ["vencimento", "venc", "expiracao", "expiração", "expiry"],
+        "bdays": ["dias uteis", "dias úteis", "dias-uteis", "dias_uteis", "dias comerciais"],
+        "type": ["tipo", "class", "opcao_tipo"],
+        "strike": ["strike", "preco de exercicio", "preço de exercicio", "preço de exercício", "exercicio", "k"],
+        "last": ["ultimo", "último", "preco", "preço", "fechamento", "close", "último negocio", "ultimo negocio"],
+        "bid": ["bid", "compra", "melhor compra", "oferta de compra"],
+        "ask": ["ask", "venda", "melhor venda", "oferta de venda"],
+        "impliedVol": ["vol impl (%)", "vol impl. (%)", "volatilidade implicita", "volatilidade implícita", "iv", "iv (%)"],
+        "delta": ["delta", "Δ"],
+        "dist_pct": ["dist (%) do strike", "dist % do strike", "distancia (%) do strike"],
+    }
+
+    def find_col(alias_list):
+        # match direto
+        for al in alias_list:
+            if al in rev_map:
+                return rev_map[al]
+        # match relaxado
+        for al in alias_list:
+            for norm, orig in rev_map.items():
+                if re.sub(r'[^a-z0-9%$ ]','', norm) == re.sub(r'[^a-z0-9%$ ]','', al):
+                    return orig
+        return None
+
+    out = pd.DataFrame()
+
+    col_symbol = find_col(aliases["symbol"])
+    if col_symbol is not None:
+        out["symbol"] = df[col_symbol]
+
+    col_exp = find_col(aliases["expiration"])
+    col_bdays = find_col(aliases["bdays"])
+    if col_exp is not None:
+        out["expiration"] = df[col_exp].map(_parse_date_any)
+    elif col_bdays is not None:
+        def _est(d):
             try:
-                df = xls.parse(sheet)
-                if df.shape[0] > best_len and df.shape[1] >= 2:
-                    best_len, best_df = df.shape[0], df
+                n = int(_br_to_float(d))
+                return (pd.Timestamp(date.today()) + BDay(n)).date()
             except Exception:
-                continue
-        if best_df is None:
-            raise RuntimeError("Não foi possível ler nenhuma planilha válida do Excel.")
-        return best_df
+                return np.nan
+        out["expiration"] = df[col_bdays].map(_est)
+    else:
+        out["expiration"] = np.nan
+
+    col_type = find_col(aliases["type"])
+    if col_type is not None:
+        out["type"] = df[col_type].astype(str).str.upper().str.strip().replace({
+            "CALL":"C","COMPRA":"C","C":"C",
+            "PUT":"P","VENDA":"P","P":"P"
+        })
+    else:
+        out["type"] = np.nan
+        if "symbol" in out.columns:
+            def infer_type(code: str):
+                if not isinstance(code, str): return np.nan
+                s = re.sub(r'[^A-Z0-9]', '', str(code).upper().strip())
+                m = re.search(r'([A-Z])\d+$', s)
+                if not m: return np.nan
+                letra = m.group(1)
+                if letra in CALL_SERIES: return 'C'
+                if letra in PUT_SERIES:  return 'P'
+                return np.nan
+            out["type"] = out["symbol"].map(infer_type)
+
+    col_strike = find_col(aliases["strike"])
+    out["strike"] = pd.to_numeric(df[col_strike].map(_br_to_float), errors="coerce") if col_strike else np.nan
+
+    # preços
+    for fld, key in [("bid","bid"), ("ask","ask"), ("last","last")]:
+        col = find_col(aliases.get(key, []))
+        if col is not None:
+            out[fld] = pd.to_numeric(df[col].map(_br_to_float), errors="coerce")
+
+    # IV / Delta
+    col_iv = find_col(aliases["impliedVol"])
+    if col_iv is not None:
+        out["impliedVol"] = pd.to_numeric(df[col_iv].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
+    col_delta = find_col(aliases["delta"])
+    if col_delta is not None:
+        out["delta"] = pd.to_numeric(df[col_delta].map(_br_to_float), errors="coerce")
+
+    # mid
+    if "bid" in out.columns and "ask" in out.columns and (out["bid"].notna().any() or out["ask"].notna().any()):
+        out["mid"] = (out["bid"].fillna(0) + out["ask"].fillna(0)) / 2.0
+    else:
+        out["mid"] = out.get("last", np.nan).fillna(0)
+
+    # IV efetiva placeholder (fallback real via HV20 ocorre depois)
+    if "impliedVol" not in out.columns:
+        out["impliedVol"] = np.nan
+
+    # garantias mínimas
+    for c in ["type","strike","expiration"]:
+        if c not in out.columns: out[c] = np.nan
+
+    return out
 
 try:
-    raw = read_raw(uploaded)
+    chain_all = _auto_read_opcoesnet(uploaded)
 except Exception as e:
     st.error(f"Falha ao ler o arquivo: {e}")
-    st.stop()
-
-st.markdown("#### 3.1) Mapeie as colunas do arquivo")
-cols = list(raw.columns)
-col1, col2, col3 = st.columns(3)
-with col1:
-    map_symbol = st.selectbox("Símbolo/Código da opção (opcional)", ["(nenhum)"] + cols, index=0,
-                              help="Código da opção (ex.: PETRA40). Se não tiver, deixa ‘(nenhum)’.")
-    map_type   = st.selectbox("Tipo (C/P)", cols,
-                              help="Coluna com ‘C’ para CALL e ‘P’ para PUT.")
-    map_strike = st.selectbox("Strike (K)", cols, help="Preço de exercício da opção.")
-with col2:
-    map_exp    = st.selectbox("Vencimento (data)", cols,
-                              help="Coluna de data de vencimento. Aceita dd/mm/aaaa, yyyy-mm-dd ou número do Excel.")
-    map_bid    = st.selectbox("Bid (compra) — opcional", ["(nenhum)"] + cols, index=0,
-                              help="Melhor preço de compra. Se não tiver, deixe vazio.")
-    map_ask    = st.selectbox("Ask (venda) — opcional", ["(nenhum)"] + cols, index=0,
-                              help="Melhor preço de venda. Se não tiver, deixe vazio.")
-with col3:
-    map_last   = st.selectbox("Último — opcional", ["(nenhum)"] + cols, index=0,
-                              help="Último preço negociado (fallback do mid).")
-    map_iv     = st.selectbox("IV (%) — opcional", ["(nenhum)"] + cols, index=0,
-                              help="Volatilidade implícita anual (ex.: 45 = 45%).")
-    map_delta  = st.selectbox("Delta — opcional", ["(nenhum)"] + cols, index=0,
-                              help="Delta da opção (se faltar, calculamos pelo BS/HV20).")
-
-# Constrói DF normalizado a partir do mapeamento
-df = pd.DataFrame()
-def _get(col):
-    return None if col == "(nenhum)" else col
-
-if _get(map_symbol): df["symbol"] = raw[_get(map_symbol)]
-df["type"]       = raw[map_type]
-df["strike"]     = pd.to_numeric(raw[map_strike].map(_br_to_float), errors="coerce")
-df["expiration"] = raw[map_exp].map(_parse_date_any)
-
-if _get(map_bid):  df["bid"]  = pd.to_numeric(raw[_get(map_bid)].map(_br_to_float), errors="coerce")
-if _get(map_ask):  df["ask"]  = pd.to_numeric(raw[_get(map_ask)].map(_br_to_float), errors="coerce")
-if _get(map_last): df["last"] = pd.to_numeric(raw[_get(map_last)].map(_br_to_float), errors="coerce")
-if _get(map_iv):   df["impliedVol"] = pd.to_numeric(raw[_get(map_iv)].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
-if _get(map_delta):df["delta"] = pd.to_numeric(raw[_get(map_delta)].map(_br_to_float), errors="coerce")
-
-# Tipo C/P (normaliza e/ou infere por letra da série, se precisar)
-df["type"] = df["type"].astype(str).str.upper().str.strip().replace({
-    'CALL':'C','COMPRA':'C','C':'C',
-    'PUT':'P','VENDA':'P','P':'P'
-})
-if "symbol" in df.columns and df["type"].isna().any():
-    def infer_type(code: str):
-        if not isinstance(code, str): return np.nan
-        s = re.sub(r'[^A-Z0-9]', '', str(code).upper().strip())
-        m = re.search(r'([A-Z])\d+$', s)
-        if not m: return np.nan
-        letra = m.group(1)
-        if letra in CALL_SERIES: return 'C'
-        if letra in PUT_SERIES:  return 'P'
-        return np.nan
-    df.loc[df["type"].isna(), "type"] = df.loc[df["type"].isna(), "symbol"].map(infer_type)
-
-# Mid price
-if "bid" in df.columns and "ask" in df.columns and (df["bid"].notna().any() or df["ask"].notna().any()):
-    df["mid"] = (df["bid"].fillna(0) + df["ask"].fillna(0)) / 2.0
-else:
-    df["mid"] = df.get("last", np.nan).fillna(0)
-
-# IV efetiva (usa HV20 se não veio IV)
-if "impliedVol" not in df.columns: df["impliedVol"] = np.nan
-df["iv_eff"] = df["impliedVol"]
-if df["iv_eff"].isna().all():
-    df["iv_eff"] = hv20
-
-# Valida vencimentos
-valid_exps = sorted([d for d in df["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))])
-if not valid_exps:
-    st.error("Nenhum vencimento válido encontrado. Revise o mapeamento (principalmente a coluna de Vencimento).")
     st.stop()
 
 # -------------------------------
 # Seleção de vencimento
 # -------------------------------
+valid_exps = sorted([d for d in chain_all["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))])
+if not valid_exps:
+    st.error("Nenhum vencimento válido encontrado. Verifique o arquivo do opções.net.")
+    st.stop()
+
 exp_choice = st.selectbox("📅 Vencimento", options=valid_exps, index=0)
 T = yearfrac(date.today(), exp_choice if isinstance(exp_choice,date) else exp_choice.date())
 days_to_exp = (exp_choice - date.today()).days if isinstance(exp_choice,date) else (exp_choice.date() - date.today()).days
-df = df[df["expiration"] == exp_choice].copy()
+df = chain_all[chain_all["expiration"] == exp_choice].copy()
+
+# Preço médio (mid) e IV efetiva
+if "impliedVol" not in df.columns:
+    df["impliedVol"] = np.nan
+df["iv_eff"] = df["impliedVol"]
+if df["iv_eff"].isna().all():
+    df["iv_eff"] = hv20
 
 # Separa OTM
 calls = df[(df["type"]=="C") & (df["strike"]>spot)].copy()
@@ -674,11 +746,8 @@ PoE_dentro = 1 − PoE_total. (Estimado por BS/Δ quando IV faltar.)
 - Linha **0** (horizontal) = **ponto de equilíbrio**.  
 - Linhas pontilhadas = **strikes** (Kp, Kc) e, quando houver, **asas** (Kp_w, Kc_w).  
 - Curva = seu **P/L por ação** no vencimento para cada preço **S**.
-
-**Passo a passo**  
-1) Escolha o **ticker** e **envie a chain**.  
-2) Mapeie corretamente as **colunas** (principalmente **Vencimento**).  
-3) Ajuste **|Δ|**, **bandas**, **cobertura** (ações/caixa) e parâmetros de **saída**.  
-4) Avalie o **Top 3** e a **tabela**.  
-5) Compare **Strangle × Iron Condor × Jade Lizard** para decidir entre **crédito maior** vs **risco limitado**.
 """)
+
+# -------------------------------
+# Fim
+# -------------------------------
