@@ -1,0 +1,1 @@
+# Strangle_Vendido_B3_v8
