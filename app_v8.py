@@ -14,15 +14,16 @@ import streamlit as st
 import yfinance as yf
 import matplotlib.pyplot as plt
 from bs4 import BeautifulSoup
-from requests_html import HTMLSession
+from requests_html import HTMLSession, AsyncHTMLSession
+import nest_asyncio
 
 # ============================================================
 # Config e título
 # ============================================================
 
-st.set_page_config(page_title="Strangle Vendido Coberto – v8 (JS render fix)", layout="wide")
+st.set_page_config(page_title="Strangle Vendido Coberto – v8 (JS render fix + loop)", layout="wide")
 st.title("💼 Strangle Vendido Coberto – Sugeridor (v8)")
-st.caption("Agora com coleta robusta no opções.net (renderização JS), além de: Saídas automáticas • Ranking prêmio/risco • PoE combinada • Resumo • Top 3 • Catálogo B3")
+st.caption("Render JS estável no opções.net (corrigido o event loop do Streamlit) • Saídas automáticas • Ranking prêmio/risco • PoE • Top 3 • Catálogo B3")
 
 # ============================================================
 # Utils / Black–Scholes
@@ -85,7 +86,6 @@ CALL_SERIES = set(list("ABCDEFGHIJKL"))
 PUT_SERIES  = set(list("MNOPQRSTUVWX"))
 
 def base_ticker_for_optionsnet(ticker: str) -> str:
-    """ 'PETR4.SA' -> 'PETR4' ; remove sufixos/espaços; uppercase """
     txt = (ticker or "").strip().upper()
     txt = re.sub(r"\.SA$", "", txt)
     txt = re.sub(r"[^A-Z0-9]", "", txt)
@@ -110,7 +110,6 @@ def try_read_csv_text(text: str) -> Optional[pd.DataFrame]:
         return None
 
 def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # 1) mapear nomes comuns (PT/EN) -> canônicos
     colmap = {
         'symbol': ['symbol','símbolo','ticker','codigo','código','asset','codigo da opcao','código da opção','codigo da opção'],
         'expiration': ['expiration','venc','vencimento','expiração','expiracao','expiry','expiration_date','venc.','vencimento (d/m/a)'],
@@ -131,7 +130,6 @@ def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
                 break
     df = df.rename(columns=rename)
 
-    # 2) se faltar TIPO, inferir pela letra da série no código da opção
     if 'type' not in df.columns and 'symbol' in df.columns:
         def infer_type(code: str):
             if not isinstance(code, str): return np.nan
@@ -144,14 +142,11 @@ def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
             return np.nan
         df['type'] = df['symbol'].map(infer_type)
 
-    # 3) coerções e formatos
     for c in ["strike","bid","ask","last","impliedVol","delta"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c].map(_br_to_float), errors="coerce")
 
-    # expiration vira date
     if "expiration" in df.columns:
-        # tentar ler como dd/mm/aaaa ou aaaa-mm-dd
         def _parse_date(x):
             if pd.isna(x): return np.nan
             s = str(x).strip()
@@ -160,25 +155,20 @@ def normalize_chain_columns(df: pd.DataFrame) -> pd.DataFrame:
                     return datetime.strptime(s, fmt).date()
                 except Exception:
                     continue
-            # se vier timestamp/Excel-like
             try:
                 return pd.to_datetime(x, dayfirst=True).date()
             except Exception:
                 return np.nan
         df["expiration"] = df["expiration"].map(_parse_date)
 
-    # garante colunas mínimas
     for c in ["symbol","expiration","type","strike"]:
         if c not in df.columns:
             df[c] = np.nan
 
-    # padroniza type
     df["type"] = df["type"].astype(str).str.upper().str.strip().replace({
         'CALL':'C','C':'C','COMPRA':'C','CALLS':'C',
         'PUT':'P','P':'P','VENDA':'P','PUTS':'P'
     })
-
-    # se não houver bid/ask, manteremos apenas 'last' como proxy
     return df.dropna(subset=["symbol","type","strike"], how="any")
 
 def _flatten_columns(df):
@@ -186,7 +176,6 @@ def _flatten_columns(df):
         df.columns = [" ".join([str(p).strip() for p in tpl if str(p).strip() not in ('','nan','None')]) for tpl in df.columns]
     else:
         df.columns = [str(c).strip() for c in df.columns]
-    # dedup
     seen, cols = {}, []
     for c in df.columns:
         if c not in seen:
@@ -197,7 +186,6 @@ def _flatten_columns(df):
     return df
 
 def _choose_table_from_html(html_text: str) -> Optional[pd.DataFrame]:
-    """Procura a maior tabela com tbody contendo linhas > 0."""
     soup = BeautifulSoup(html_text, "html.parser")
     best_tbl, best_rows = None, -1
     for tbl in soup.find_all("table"):
@@ -207,7 +195,6 @@ def _choose_table_from_html(html_text: str) -> Optional[pd.DataFrame]:
             best_rows, best_tbl = nrows, tbl
     if not best_tbl or best_rows <= 0:
         return None
-    # Tenta header simples, depois multinível
     table_html = str(best_tbl)
     try:
         df = pd.read_html(io.StringIO(table_html), flavor="bs4", thousands=".", decimal=",", header=0)[0]
@@ -217,27 +204,46 @@ def _choose_table_from_html(html_text: str) -> Optional[pd.DataFrame]:
         df = pd.read_html(io.StringIO(table_html), flavor="bs4", thousands=".", decimal=",", header=[0,1])[0]
     return _flatten_columns(df)
 
+# ------- NOVO: renderizador estável com event loop explícito -------
+
+async def _fetch_render_async(url: str) -> str:
+    asess = AsyncHTMLSession()
+    r = await asess.get(url, headers=HEADERS, timeout=40)
+    # arender executa JS em Chromium headless (pyppeteer)
+    await r.html.arender(timeout=90, sleep=2)
+    return r.html.html
+
+def render_with_event_loop(url: str) -> str:
+    """
+    Garante um event loop válido dentro da thread do Streamlit.
+    Usa nest_asyncio para permitir reentrância.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    # Permite reuse do loop na thread do ScriptRunner
+    nest_asyncio.apply()
+    return loop.run_until_complete(_fetch_render_async(url))
+
 @st.cache_data(show_spinner=False)
 def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
-    """
-    Usa requests-html (r.html.render) para executar JS da página,
-    então seleciona a maior tabela e normaliza colunas.
-    """
-    # extrai ticker base a partir da URL recebida do app
     ticker_base = ticker_url.rsplit("/", 1)[-1].strip().upper()
     url = f"https://opcoes.net.br/opcoes/bovespa/{ticker_base}"
 
-    # 1) HTML com renderização JS
-    sess = HTMLSession()
-    r = sess.get(url, headers=HEADERS, timeout=40)
-    # renderiza JS (pyppeteer) – pode demorar alguns segundos na 1ª vez
-    r.html.render(timeout=90, sleep=2)
-    df = _choose_table_from_html(r.html.html)
-    if df is not None and not df.empty:
-        return normalize_chain_columns(df)
-
-    # 2) Fallback: tentar a própria resposta sem render (casos simples)
+    # 1) Renderização JS com loop explícito
     try:
+        html = render_with_event_loop(url)
+        df = _choose_table_from_html(html)
+        if df is not None and not df.empty:
+            return normalize_chain_columns(df)
+    except Exception as e:
+        pass  # tenta fallbacks abaixo
+
+    # 2) Fallback: HTML bruto sem render
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=40)
         tables = pd.read_html(r.text)
         if tables:
             df2 = _flatten_columns(max(tables, key=lambda t: t.shape[0]*t.shape[1]))
@@ -247,10 +253,10 @@ def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # 3) Rota alternativa simples (pode ajudar em alguns dias)
-    alt = f"https://opcoes.net.br/opcoes2/bovespa?ativo={ticker_base}"
-    rr = requests.get(alt, headers=HEADERS, timeout=40)
+    # 3) Rota alternativa
     try:
+        alt = f"https://opcoes.net.br/opcoes2/bovespa?ativo={ticker_base}"
+        rr = requests.get(alt, headers=HEADERS, timeout=40)
         tables = pd.read_html(rr.text)
         if tables:
             df3 = _flatten_columns(max(tables, key=lambda t: t.shape[0]*t.shape[1]))
@@ -260,7 +266,7 @@ def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    raise RuntimeError("Não foi possível obter a tabela de opções (após renderização JS e fallbacks).")
+    raise RuntimeError("Não foi possível obter a tabela de opções (render + fallbacks).")
 
 # ============================================================
 # Yahoo/IV helpers
@@ -268,7 +274,6 @@ def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_spot_and_iv_proxy(yahoo_ticker: str):
-    """Retorna (spot, hv20_atual, serie_proxy_iv_diaria_df)"""
     try:
         y = yf.Ticker(yahoo_ticker)
         hist = y.history(period="2y")
@@ -429,7 +434,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         return None
 
     # mid e IV efetiva
-    # Se bid/ask não existirem, usar 'last' como proxy do prêmio
     if "bid" in chain.columns and "ask" in chain.columns and chain["bid"].notna().any() and chain["ask"].notna().any():
         chain["mid"] = (chain["bid"].fillna(0) + chain["ask"].fillna(0)) / 2.0
     else:
@@ -565,7 +569,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
                 if qty < 1:
                     continue
                 be_low, be_high = Kp - mid_credit, Kc + mid_credit
-                # Probabilidades combinadas
                 probITM_put = float(p.get("prob_ITM"))
                 probITM_call = float(c.get("prob_ITM"))
                 poe_total = min(1.0, max(0.0, probITM_put + probITM_call))
@@ -596,22 +599,16 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         st.warning("Não há strangles possíveis respeitando cobertura (ações/caixa).")
         return None
 
-    # Métricas de retorno e score de risco
     combo_df["retorno_pct"] = combo_df["credit_total_por_contrato"] / spot
     combo_df["risk_score"] = (combo_df["probITM_call"] + combo_df["probITM_put"]) / 2.0
     combo_df["score_final"] = combo_df["retorno_pct"] / (combo_df["risk_score"] + 0.01)
 
-    # ========================================================
-    # Lógica de SAÍDA e instruções operacionais
-    # ========================================================
     def build_exit_guidance(row):
         Kc, Kp = row["K_call"], row["K_put"]
         credit = row["credit_total_por_contrato"]
-        # proximidade relativa ao strike
         near_call = abs(spot - Kc) / Kc <= prox_pct
         near_put  = abs(spot - Kp) / Kp <= prox_pct
         time_critical = days_to_exp <= days_exit_thresh
-        # ordens-alvo para recomprar
         target_debit_per_leg = (1 - capture_target) * credit / 2.0
         target_debit_both = (1 - capture_target) * credit
         msg = []
@@ -627,24 +624,19 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         else:
             msg.append("✅ **Conforto**: preço razoavelmente distante dos strikes ou ainda há tempo até o vencimento.")
             msg.append("➡️ Ação: **mantenha** e monitore. Considere encerrar se capturar boa parte do prêmio.")
-
-        # alvo para manter percentual do prêmio
         msg.append(f"💰 Meta didática: **encerrar** quando capturar **{int(capture_target*100)}%** do prêmio.")
         msg.append(f"🔧 Ordem sugestão p/ **zerar ambas**: recomprar por ~ **R$ {target_debit_both:.2f}/ação** (≈ {(1-capture_target):.0%} do crédito).")
         msg.append(f"🔧 Ordem sugestão p/ **zerar só a perna ameaçada**: ~ **R$ {target_debit_per_leg:.2f}/ação** por perna.")
         return "  \n".join(msg), ("⚠️" if (time_critical and (near_call or near_put)) else "✅")
 
     if show_exit_help:
-        exit_texts = []
-        alerts = []
+        exit_texts, alerts = [], []
         for _, r in combo_df.iterrows():
             text, alert = build_exit_guidance(r)
-            exit_texts.append(text)
-            alerts.append(alert)
+            exit_texts.append(text); alerts.append(alert)
         combo_df["Instrucao_saida"] = exit_texts
         combo_df["Alerta_saida"] = alerts
 
-    # Seleção por banda e ranking
     def pick_by_band(df, band, n=3):
         sub = df[(df["band_call"]==band) & (df["band_put"]==band)].copy()
         if sub.empty: return sub
@@ -662,9 +654,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
 
     result = pd.concat(final, ignore_index=True)
 
-    # ========================================================
-    # Resumo do ticker (didático)
-    # ========================================================
     with st.expander("📊 Resumo do Ticker (médias e destaques)"):
         col1, col2, col3, col4 = st.columns(4)
         with col1: st.metric("Combos sugeridos", f"{len(result):,}")
@@ -672,9 +661,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         with col3: st.metric("PoE_total médio", f"{result['poe_total'].mean():.0%}")
         with col4: st.metric("Faixa BE média", f"R$ {result['be_range'].mean():.2f}")
 
-    # ========================================================
-    # Top 3 recomendações (globais por score)
-    # ========================================================
     st.markdown("### 🏆 Top 3 Recomendações (melhor prêmio/risco)")
     top3 = combo_df.sort_values(by=["score_final","credit_total_na_carteira","be_range"], ascending=[False,False,False]).head(3)
     if not top3.empty:
@@ -688,9 +674,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     else:
         st.info("Sem combinações suficientes para ranquear o Top 3.")
 
-    # ========================================================
-    # Tabela principal (com novas colunas + instruções de saída)
-    # ========================================================
     st.subheader("📌 Sugestões por banda de risco (ranqueadas por prêmio/risco)")
     st.caption("PoE_total = probabilidade de qualquer perna ser exercida; PoE_dentro = prob. do preço ficar entre os strikes no vencimento.")
 
@@ -722,13 +705,11 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         use_container_width=True
     )
 
-    # Export CSV (por ticker)
     csv_bytes = result.to_csv(index=False).encode("utf-8")
     st.download_button(f"⬇️ Exportar sugestões ({tk})", data=csv_bytes,
                        file_name=f"strangles_{base_ticker_for_optionsnet(tk)}_v8.csv",
                        mime="text/csv", key=f"dl_{tk}")
 
-    # Payoff plot
     st.markdown("### 📈 Payoff no Vencimento (P/L por ação)")
     result["id"] = (result["Risco"] + " | " + result["call_symbol"].astype(str) + " & " +
                     result["put_symbol"].astype(str) + " | Kc=" + result["K_call"].round(2).astype(str) +
@@ -751,7 +732,6 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     plt.ylabel("P/L por ação (R$)")
     st.pyplot(fig, use_container_width=True)
 
-    # Dicas didáticas adicionais
     with st.expander("🧭 Quando SAIR da operação? (didático)"):
         st.markdown(f"""
 - **Perto do vencimento** (**≤ {days_exit_thresh} dias**) **e** preço **encostando em um strike** (±{int(prox_pct*100)}%):  
@@ -770,28 +750,25 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
 
 with st.sidebar:
     st.markdown("---")
-    st.markdown("**Requisitos extras para coleta JS:** `requests-html`, `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`")
+    st.markdown("**Requisitos extras para coleta JS:** `requests-html`, `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`, `nest_asyncio`")
 
-# Cria abas
 tabs = st.tabs(tickers)
 
 all_results = []
 for tk, tab in zip(tickers, tabs):
     with tab:
         st.subheader(f"Ativo: {tk}")
-        # Parâmetros específicos por ticker (widgets com keys únicas)
         colA, colB, colC = st.columns(3)
         with colA:
-            shares_owned = st.number_input(f"Ações em carteira ({tk})", min_value=0, step=100, value=0, key=f"shares_{tk}", help="Quantidade de ações disponíveis para CALL coberta.")
+            shares_owned = st.number_input(f"Ações em carteira ({tk})", min_value=0, step=100, value=0, key=f"shares_{tk}")
         with colB:
-            cash_available = st.number_input(f"Caixa disponível (R$) ({tk})", min_value=0.0, step=100.0, value=10000.0, format="%.2f", key=f"cash_{tk}", help="Dinheiro reservado para PUT garantida (K_put × lote × qty).")
+            cash_available = st.number_input(f"Caixa disponível (R$) ({tk})", min_value=0.0, step=100.0, value=10000.0, format="%.2f", key=f"cash_{tk}")
         with colC:
-            lot_size = st.number_input(f"Tamanho do contrato ({tk})", min_value=1, step=1, value=100, key=f"lot_{tk}", help="Geralmente 100 ações por contrato na B3.")
+            lot_size = st.number_input(f"Tamanho do contrato ({tk})", min_value=1, step=1, value=100, key=f"lot_{tk}")
         res = run_pipeline_for_ticker(tk, shares_owned, cash_available, lot_size)
         if isinstance(res, pd.DataFrame) and not res.empty:
             all_results.append(res)
 
-# Export combinado (todas as abas)
 if all_results:
     combined = pd.concat(all_results, ignore_index=True)
     st.markdown("---")
