@@ -1,7 +1,8 @@
 # app_v9_b3_file.py
 # v9 didático (1 ticker por vez) com:
 # - Lista B3 (Dados de Mercado)
-# - Upload da chain (Excel/CSV do opcoes.net) com DETECÇÃO AUTOMÁTICA de cabeçalho (linha 2 OU linha 1)
+# - Upload da chain (Excel/CSV do opcoes.net) com detecção automática de cabeçalho (linha 2 OU linha 1)
+# - Mapeamento automático + fallback por POSIÇÃO (coluna B) para "Vencimento" (dd/mm/aaaa)
 # - Tooltips (help=) em TODOS os controles da barra lateral
 # - Sugestões de strangle + saídas didáticas
 # - Aba "📈 Comparar estratégias" (Strangle × Iron Condor × Jade Lizard)
@@ -90,7 +91,7 @@ def _excel_serial_to_date(n):
     try:
         n = float(n)
         if n <= 0: return np.nan
-        base = datetime(1899, 12, 30)  # pandas/Excel epoch (com bug do 1900)
+        base = datetime(1899, 12, 30)  # pandas/Excel epoch
         return (base + timedelta(days=int(n))).date()
     except Exception:
         return np.nan
@@ -241,11 +242,11 @@ if np.isnan(spot) or spot <= 0:
     st.stop()
 
 # -------------------------------
-# Upload (opcoes.net) — leitura automática (header 2 OU 1)
+# Upload (opcoes.net) — leitura automática
 # -------------------------------
 st.markdown(f"### 3) Envie a *option chain* do **opcoes.net** (Excel/CSV) para **{TICKER}**")
 uploaded = st.file_uploader(
-    "Detecção automática do cabeçalho: tenta linha 2 (header=1) e linha 1 (header=0).",
+    "Detecção automática do cabeçalho: tenta linha 2 (header=1) e linha 1 (header=0). Vencimento será lido do nome OU da coluna B se necessário.",
     type=["xlsx","xls","csv"]
 )
 if uploaded is None:
@@ -254,10 +255,12 @@ if uploaded is None:
 
 def _auto_read_opcoesnet(file) -> pd.DataFrame:
     """
-    Lê .xlsx/.csv do opcoes.net com detecção automática de cabeçalho:
-    - tenta header=1 (linha 2) *e* header=0 (linha 1)
-    - normaliza nomes de colunas e mapeia aliases automaticamente
-    - CALCULA MID de forma robusta (sem .fillna() em float)
+    Lê .xlsx/.csv do opcoes.net com detecção automática:
+    - testa header=1 e header=0
+    - busca 'Vencimento' por aliases; se não achar, usa a COLUNA B (iloc[:,1]) como fallback (formato dd/mm/aaaa)
+    - normaliza colunas e mapeia aliases
+    - calcula 'mid' robusto
+    - retorno: DataFrame com index alinhado e colunas: [symbol?, type, strike, bid?, ask?, last?, mid, impliedVol?, delta?, expiration]
     """
     name = file.name.lower()
     file_bytes = file.getvalue()  # lê uma vez
@@ -269,23 +272,21 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
         else:
             return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl", header=header)
 
+    # 1) Ler com header=1, senão header=0
     df = None
-    for h in (1, 0):  # primeiro o padrão antigo (linha 2), depois linha 1
+    header_used = None
+    for h in (1, 0):
         try:
             _df = try_read(h)
-            if _df is not None and _df.shape[1] >= 3:
-                df = _df
-            # quebra só se conseguiu algo minimamente válido
-            if df is not None:
+            if _df is not None and _df.shape[1] >= 2:
+                df = _df.dropna(how="all").copy()
+                header_used = h
                 break
         except Exception:
             continue
 
     if df is None:
         raise RuntimeError("Falha ao ler a planilha: tente exportar novamente em .xlsx ou .csv.")
-
-    # Limpeza básica
-    df = df.dropna(how="all").copy()
 
     # Normaliza nomes (original -> normalizado)
     def _clean_cols(cols):
@@ -327,29 +328,15 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
                     return orig
         return None
 
-    # --- DataFrame de saída deve ter o MESMO ÍNDICE da planilha ---
+    # DataFrame de saída com MESMO índice
     out = pd.DataFrame(index=df.index)
 
-    # Colunas principais
+    # symbol (opcional)
     col_symbol = find_col(aliases["symbol"])
     if col_symbol is not None:
         out["symbol"] = df[col_symbol]
 
-    col_exp = find_col(aliases["expiration"])
-    col_bdays = find_col(aliases["bdays"])
-    if col_exp is not None:
-        out["expiration"] = df[col_exp].map(_parse_date_any)
-    elif col_bdays is not None:
-        def _est(d):
-            try:
-                n = int(_br_to_float(d))
-                return (pd.Timestamp(date.today()) + BDay(n)).date()
-            except Exception:
-                return np.nan
-        out["expiration"] = df[col_bdays].map(_est)
-    else:
-        out["expiration"] = np.nan
-
+    # type
     col_type = find_col(aliases["type"])
     if col_type is not None:
         out["type"] = df[col_type].astype(str).str.upper().str.strip().replace({
@@ -370,18 +357,17 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
                 return np.nan
             out["type"] = out["symbol"].map(infer_type)
 
+    # strike
     col_strike = find_col(aliases["strike"])
     out["strike"] = pd.to_numeric(df[col_strike].map(_br_to_float), errors="coerce") if col_strike else np.nan
 
-    # preços (cada série alinhada ao índice)
+    # preços
     col_bid = find_col(aliases["bid"])
     if col_bid is not None:
         out["bid"] = pd.to_numeric(df[col_bid].map(_br_to_float), errors="coerce")
-
     col_ask = find_col(aliases["ask"])
     if col_ask is not None:
         out["ask"] = pd.to_numeric(df[col_ask].map(_br_to_float), errors="coerce")
-
     col_last = find_col(aliases["last"])
     if col_last is not None:
         out["last"] = pd.to_numeric(df[col_last].map(_br_to_float), errors="coerce")
@@ -394,23 +380,68 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
     if col_delta is not None:
         out["delta"] = pd.to_numeric(df[col_delta].map(_br_to_float), errors="coerce")
 
-    # --- MID robusto (funciona mesmo sem bid/ask/last) ---
+    # MID robusto
     bid_series  = out["bid"]  if "bid"  in out.columns else pd.Series(np.nan, index=df.index)
     ask_series  = out["ask"]  if "ask"  in out.columns else pd.Series(np.nan, index=df.index)
     last_series = out["last"] if "last" in out.columns else pd.Series(np.nan, index=df.index)
-
     has_quote = bid_series.notna() | ask_series.notna()
     mid_from_quotes = (bid_series.fillna(0) + ask_series.fillna(0)) / 2.0
-
     out["mid"] = np.where(has_quote, mid_from_quotes, last_series)
 
-    # IV efetiva placeholder (fallback real via HV20 ocorre depois)
+    # expiration (por nome OU fallback por POSIÇÃO — coluna B)
+    col_exp = find_col(aliases["expiration"])
+    col_bdays = find_col(aliases["bdays"])
+    exp_series = None
+
+    if col_exp is not None:
+        exp_series = df[col_exp]
+    elif col_bdays is not None:
+        def _est(d):
+            try:
+                n = int(_br_to_float(d))
+                return (pd.Timestamp(date.today()) + BDay(n)).date()
+            except Exception:
+                return np.nan
+        out["expiration"] = df[col_bdays].map(_est)
+    else:
+        # 👉 Fallback: usar a COLUNA B (segunda coluna) conforme você informou
+        try:
+            if df.shape[1] >= 2:
+                exp_series = df.iloc[:, 1]  # coluna B
+        except Exception:
+            exp_series = None
+
+    if exp_series is not None:
+        parsed = exp_series.map(_parse_date_any)
+        # checagem de qualidade: pelo menos 10% datas válidas
+        valid_ratio = parsed.notna().mean() if len(parsed) else 0.0
+        if valid_ratio >= 0.1:
+            out["expiration"] = parsed
+        else:
+            # última tentativa: tentar converter com dayfirst à força
+            try:
+                forced = pd.to_datetime(exp_series.astype(str).str.strip(), dayfirst=True, errors="coerce").dt.date
+                out["expiration"] = forced
+            except Exception:
+                out["expiration"] = np.nan
+
+    if "expiration" not in out.columns:
+        out["expiration"] = np.nan
+
+    # IV placeholder (fallback real via HV20 ocorre depois)
     if "impliedVol" not in out.columns:
         out["impliedVol"] = np.nan
 
     # garantias mínimas
     for c in ["type","strike","expiration"]:
         if c not in out.columns: out[c] = np.nan
+
+    # Debug opcional
+    with st.expander("🛠️ Diagnóstico de leitura (opcional)"):
+        st.write(f"Header usado: {header_used} (1 = linha 2, 0 = linha 1)")
+        st.write("Algumas colunas mapeadas:", list(out.columns))
+        st.write("Amostra (5 linhas):")
+        st.dataframe(out.head())
 
     return out
 
@@ -425,7 +456,7 @@ except Exception as e:
 # -------------------------------
 valid_exps = sorted([d for d in chain_all["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))])
 if not valid_exps:
-    st.error("Nenhum vencimento válido encontrado. Verifique o arquivo do opções.net.")
+    st.error("Nenhum vencimento válido encontrado. Verifique o arquivo (coluna 'Vencimento' ou a coluna B).")
     st.stop()
 
 exp_choice = st.selectbox("📅 Vencimento", options=valid_exps, index=0)
@@ -462,11 +493,9 @@ for side_df, side in [(calls,"C"), (puts,"P")]:
 # Filtro |Δ|
 def dfilter(dfi: pd.DataFrame) -> pd.DataFrame:
     if "delta" not in dfi.columns: return dfi
-    dfo = dfi.copy(); dfo["abs_delta"] = dfo["delta"].abs()
-    if delta_min>0: dfo = dfo[dfo["abs_delta"]>=delta_min]
-    if delta_max>0: dfo = dfo[dfi["abs_delta"]<=delta_max] if "abs_delta" in dfo.columns else dfo
-    if "abs_delta" in dfo.columns:
-        dfo = dfo[(dfo["abs_delta"]>=delta_min) & (dfo["abs_delta"]<=delta_max)]
+    dfo = dfi.copy()
+    dfo["abs_delta"] = dfo["delta"].abs()
+    dfo = dfo[(dfo["abs_delta"]>=delta_min) & (dfo["abs_delta"]<=delta_max)]
     return dfo
 
 calls = dfilter(calls); puts = dfilter(puts)
