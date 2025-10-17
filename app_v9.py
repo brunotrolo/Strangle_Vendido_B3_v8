@@ -1,11 +1,13 @@
 # app_v9_b3_file.py
-# v9 didático (1 ticker por vez) com:
-# - Lista B3 (Dados de Mercado)
-# - Upload da chain (Excel/CSV do opcoes.net) com detecção automática de cabeçalho (linha 2 OU linha 1)
-# - Mapeamento automático + fallback por POSIÇÃO (coluna B) para "Vencimento" (dd/mm/aaaa)
-# - Tooltips (help=) em TODOS os controles da barra lateral
-# - Sugestões de strangle + saídas didáticas
-# - Aba "📈 Comparar estratégias" (Strangle × Iron Condor × Jade Lizard)
+# v9 (1 ticker por vez) — robusto para planilhas do opcoes.net
+# - Busca tickers B3 (Dados de Mercado)
+# - Upload Excel/CSV com detecção automática de header (linha 2 OU 1)
+# - Vencimento por nome OU fallback na COLUNA B (dd/mm/aaaa)
+# - Normalização de 'type' (C/P) com múltiplas heurísticas + fallback por strike vs. spot
+# - Cálculo de mid robusto, deltas por BS quando faltarem
+# - Sugestões de strangle vendido coberto + instruções de saída
+# - Aba 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)
+# Requisitos: streamlit, pandas, numpy, matplotlib, requests, beautifulsoup4, lxml, yfinance, openpyxl
 
 import io
 import re
@@ -21,21 +23,12 @@ from bs4 import BeautifulSoup
 import matplotlib.pyplot as plt
 from pandas.tseries.offsets import BDay
 
-# -------------------------------
-# Configuração
-# -------------------------------
-st.set_page_config(
-    page_title="Strangle Vendido Coberto — v9 (B3 + arquivo)",
-    page_icon="💼",
-    layout="wide",
-)
-
+# ---- Config ----
+st.set_page_config(page_title="Strangle Vendido Coberto — v9", page_icon="💼", layout="wide")
 st.title("💼 Strangle Vendido Coberto — v9 (B3 + arquivo)")
 st.caption("Escolha um ticker da B3, envie a planilha do opções.net (.xlsx/.csv) e receba sugestões + comparação (Strangle × Iron Condor × Jade Lizard).")
 
-# -------------------------------
-# Utilidades
-# -------------------------------
+# ---- Utils ----
 CALL_SERIES = set(list("ABCDEFGHIJKL"))
 PUT_SERIES  = set(list("MNOPQRSTUVWX"))
 SQRT_2 = np.sqrt(2.0)
@@ -91,7 +84,7 @@ def _excel_serial_to_date(n):
     try:
         n = float(n)
         if n <= 0: return np.nan
-        base = datetime(1899, 12, 30)  # pandas/Excel epoch
+        base = datetime(1899, 12, 30)
         return (base + timedelta(days=int(n))).date()
     except Exception:
         return np.nan
@@ -114,9 +107,7 @@ def _parse_date_any(x):
     except Exception:
         return np.nan
 
-# -------------------------------
-# Tickers da B3 (Dados de Mercado)
-# -------------------------------
+# ---- B3 tickers ----
 @st.cache_data(ttl=6*60*60, show_spinner=False)
 def fetch_b3_tickers():
     url = "https://www.dadosdemercado.com.br/acoes"
@@ -156,9 +147,7 @@ tickers_list = fetch_b3_tickers()
 if not tickers_list:
     st.warning("Não consegui carregar a lista de tickers do site. Você ainda pode digitar o ticker manualmente.")
 
-# -------------------------------
-# Escolha de 1 ticker por vez
-# -------------------------------
+# ---- Escolha de 1 ticker ----
 col_tk1, col_tk2 = st.columns([2,1])
 with col_tk1:
     if tickers_list:
@@ -171,53 +160,30 @@ with col_tk2:
     st.metric("Ticker selecionado", TICKER if TICKER else "—")
 if not TICKER: st.stop()
 
-# -------------------------------
-# Sidebar — parâmetros com tooltips
-# -------------------------------
+# ---- Sidebar / parâmetros ----
 with st.sidebar:
     st.header("⚙️ Parâmetros")
-    r = st.number_input(
-        "Taxa livre de risco anual (r)",
-        min_value=0.0, max_value=1.0, value=0.11, step=0.005, format="%.3f",
-        help="Usada no Black–Scholes. No Brasil, aproxime pela SELIC anualizada. Ex.: 0,11 = 11% a.a."
-    )
-    delta_min = st.number_input(
-        "|Δ| mínimo", min_value=0.0, max_value=1.0, value=0.00, step=0.01,
-        help="Filtro de ‘moneyness’ por Delta (menor = mais OTM)."
-    )
-    delta_max = st.number_input(
-        "|Δ| máximo", min_value=0.0, max_value=1.0, value=0.35, step=0.01,
-        help="Vendedores costumam usar |Δ| ~ 0,05–0,35 (opções OTM)."
-    )
-    risk_selection = st.multiselect(
-        "Bandas de risco por perna", ["Baixo","Médio","Alto"], default=["Baixo","Médio","Alto"],
-        help="Classifica pela prob. de exercício (PoE) de cada perna: Baixo 0–15%, Médio 15–35%, Alto 35–55%."
-    )
-    lookback_days = st.number_input(
-        "Janela p/ IV Rank/Percentil (dias)", min_value=60, max_value=500, value=252, step=1,
-        help="Compara a IV atual vs histórico (proxy por HV20 se IV faltar). IV alta favorece vender prêmio."
-    )
+    r = st.number_input("Taxa livre de risco anual (r)", min_value=0.0, max_value=1.0, value=0.11, step=0.005, format="%.3f",
+                        help="Usada no Black–Scholes. No Brasil, aproxime pela SELIC anualizada. Ex.: 0,11 = 11% a.a.")
+    delta_min = st.number_input("|Δ| mínimo", min_value=0.0, max_value=1.0, value=0.00, step=0.01,
+                                help="Filtro de ‘moneyness’ por Delta (menor = mais OTM).")
+    delta_max = st.number_input("|Δ| máximo", min_value=0.0, max_value=1.0, value=0.35, step=0.01,
+                                help="Vendedores costumam usar |Δ| ~ 0,05–0,35 (opções OTM).")
+    risk_selection = st.multiselect("Bandas de risco por perna", ["Baixo","Médio","Alto"], default=["Baixo","Médio","Alto"],
+                                    help="Classifica pela prob. de exercício (PoE): Baixo 0–15%, Médio 15–35%, Alto 35–55%.")
+    lookback_days = st.number_input("Janela p/ IV Rank/Percentil (dias)", min_value=60, max_value=500, value=252, step=1,
+                                    help="Compara a IV atual vs histórico (proxy por HV20 se IV faltar).")
     st.markdown("---")
-    show_exit_help = st.checkbox(
-        "Mostrar instruções de SAÍDA", value=True,
-        help="Recomprar a perna ameaçada perto do vencimento OU encerrar após capturar 70–80% do prêmio."
-    )
-    days_exit_thresh = st.number_input(
-        "Dias até vencimento p/ alerta", min_value=1, max_value=30, value=10,
-        help="Com ≤ N dias, as mensagens de saída ficam mais proativas."
-    )
-    prox_pct = st.number_input(
-        "Proximidade ao strike (%)", min_value=1, max_value=20, value=5,
-        help="Considera o strike ‘ameaçado’ quando S está a menos de X% dele."
-    ) / 100.0
-    capture_target = st.number_input(
-        "Meta de captura do prêmio (%)", min_value=10, max_value=95, value=70,
-        help="Meta para encerrar com ganho parcial (ex.: 70% já capturado → zera o risco)."
-    ) / 100.0
+    show_exit_help = st.checkbox("Mostrar instruções de SAÍDA", value=True,
+                                 help="Recomprar a perna ameaçada perto do vencimento OU encerrar após capturar 70–80% do prêmio.")
+    days_exit_thresh = st.number_input("Dias até vencimento p/ alerta", min_value=1, max_value=30, value=10,
+                                       help="Com ≤ N dias, mensagens de saída ficam mais proativas.")
+    prox_pct = st.number_input("Proximidade ao strike (%)", min_value=1, max_value=20, value=5,
+                               help="Considera strike ‘ameaçado’ quando S está a menos de X% dele.") / 100.0
+    capture_target = st.number_input("Meta de captura do prêmio (%)", min_value=10, max_value=95, value=70,
+                                     help="Encerrar com ganho parcial (ex.: 70% capturado → zera o risco).") / 100.0
 
-# -------------------------------
-# Spot e HV20 (proxy IV)
-# -------------------------------
+# ---- Spot & HV20 ----
 @st.cache_data(show_spinner=False)
 def load_spot_and_hv20(yahoo_ticker: str):
     try:
@@ -241,12 +207,10 @@ if np.isnan(spot) or spot <= 0:
     st.error("Não foi possível obter o preço à vista (Yahoo). Verifique o ticker.")
     st.stop()
 
-# -------------------------------
-# Upload (opcoes.net) — leitura automática
-# -------------------------------
+# ---- Upload ----
 st.markdown(f"### 3) Envie a *option chain* do **opcoes.net** (Excel/CSV) para **{TICKER}**")
 uploaded = st.file_uploader(
-    "Detecção automática do cabeçalho: tenta linha 2 (header=1) e linha 1 (header=0). Vencimento será lido do nome OU da coluna B se necessário.",
+    "Detecção automática: testa header linha 2 (header=1) e linha 1 (header=0). Vencimento: nome da coluna OU fallback coluna B (dd/mm/aaaa).",
     type=["xlsx","xls","csv"]
 )
 if uploaded is None:
@@ -254,16 +218,8 @@ if uploaded is None:
     st.stop()
 
 def _auto_read_opcoesnet(file) -> pd.DataFrame:
-    """
-    Lê .xlsx/.csv do opcoes.net com detecção automática:
-    - testa header=1 e header=0
-    - busca 'Vencimento' por aliases; se não achar, usa a COLUNA B (iloc[:,1]) como fallback (formato dd/mm/aaaa)
-    - normaliza colunas e mapeia aliases
-    - calcula 'mid' robusto
-    - retorno: DataFrame com index alinhado e colunas: [symbol?, type, strike, bid?, ask?, last?, mid, impliedVol?, delta?, expiration]
-    """
     name = file.name.lower()
-    file_bytes = file.getvalue()  # lê uma vez
+    file_bytes = file.getvalue()
 
     def try_read(header):
         if name.endswith(".csv"):
@@ -272,23 +228,18 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
         else:
             return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl", header=header)
 
-    # 1) Ler com header=1, senão header=0
-    df = None
-    header_used = None
+    df, header_used = None, None
     for h in (1, 0):
         try:
             _df = try_read(h)
             if _df is not None and _df.shape[1] >= 2:
-                df = _df.dropna(how="all").copy()
-                header_used = h
-                break
+                df = _df.dropna(how="all").copy(); header_used = h; break
         except Exception:
             continue
-
     if df is None:
-        raise RuntimeError("Falha ao ler a planilha: tente exportar novamente em .xlsx ou .csv.")
+        raise RuntimeError("Falha ao ler a planilha (.xlsx/.csv).")
 
-    # Normaliza nomes (original -> normalizado)
+    # Normaliza nomes
     def _clean_cols(cols):
         out = []
         for c in cols:
@@ -297,11 +248,9 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
             c2 = _strip_accents(c1).lower()
             out.append((c0, c2))
         return out
-
     norm_pairs = _clean_cols(df.columns)
     rev_map  = {norm: orig for orig, norm in norm_pairs}
 
-    # Aliases tolerantes
     aliases = {
         "symbol": ["ticker", "codigo", "código", "opcao", "opção", "símbolo", "simbolo"],
         "expiration": ["vencimento", "venc", "expiracao", "expiração", "expiry"],
@@ -313,74 +262,72 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
         "ask": ["ask", "venda", "melhor venda", "oferta de venda"],
         "impliedVol": ["vol impl (%)", "vol impl. (%)", "volatilidade implicita", "volatilidade implícita", "iv", "iv (%)"],
         "delta": ["delta", "Δ"],
-        "dist_pct": ["dist (%) do strike", "dist % do strike", "distancia (%) do strike"],
     }
 
     def find_col(alias_list):
-        # match direto
         for al in alias_list:
-            if al in rev_map:
-                return rev_map[al]
-        # match relaxado
+            if al in rev_map: return rev_map[al]
         for al in alias_list:
             for norm, orig in rev_map.items():
                 if re.sub(r'[^a-z0-9%$ ]','', norm) == re.sub(r'[^a-z0-9%$ ]','', al):
                     return orig
         return None
 
-    # DataFrame de saída com MESMO índice
     out = pd.DataFrame(index=df.index)
 
     # symbol (opcional)
-    col_symbol = find_col(aliases["symbol"])
-    if col_symbol is not None:
-        out["symbol"] = df[col_symbol]
+    c_symbol = find_col(aliases["symbol"])
+    if c_symbol is not None:
+        out["symbol"] = df[c_symbol]
 
-    # type
-    col_type = find_col(aliases["type"])
-    if col_type is not None:
-        out["type"] = df[col_type].astype(str).str.upper().str.strip().replace({
+    # type — normalização + heurísticas
+    c_type = find_col(aliases["type"])
+    if c_type is not None:
+        tnorm = df[c_type].astype(str).str.upper().str.strip()
+        out["type"] = (tnorm.replace({
             "CALL":"C","COMPRA":"C","C":"C",
             "PUT":"P","VENDA":"P","P":"P"
-        })
+        }))
     else:
         out["type"] = np.nan
-        if "symbol" in out.columns:
-            def infer_type(code: str):
-                if not isinstance(code, str): return np.nan
-                s = re.sub(r'[^A-Z0-9]', '', str(code).upper().strip())
-                m = re.search(r'([A-Z])\d+$', s)
-                if not m: return np.nan
-                letra = m.group(1)
-                if letra in CALL_SERIES: return 'C'
-                if letra in PUT_SERIES:  return 'P'
-                return np.nan
-            out["type"] = out["symbol"].map(infer_type)
+
+    # Se ainda não houver C/P, tente pelas letras do símbolo
+    if out.get("type", pd.Series(dtype=object)).isna().all() and "symbol" in out.columns:
+        def infer_from_symbol(code: str):
+            if not isinstance(code, str): return np.nan
+            s = re.sub(r'[^A-Z0-9]', '', code.upper())
+            m = re.search(r'([A-Z])\d+$', s)
+            if not m: return np.nan
+            letra = m.group(1)
+            if letra in CALL_SERIES: return 'C'
+            if letra in PUT_SERIES:  return 'P'
+            return np.nan
+        out["type"] = out["symbol"].map(infer_from_symbol)
 
     # strike
-    col_strike = find_col(aliases["strike"])
-    out["strike"] = pd.to_numeric(df[col_strike].map(_br_to_float), errors="coerce") if col_strike else np.nan
+    c_strike = find_col(aliases["strike"])
+    out["strike"] = pd.to_numeric(df[c_strike].map(_br_to_float), errors="coerce") if c_strike else np.nan
 
     # preços
-    col_bid = find_col(aliases["bid"])
-    if col_bid is not None:
-        out["bid"] = pd.to_numeric(df[col_bid].map(_br_to_float), errors="coerce")
-    col_ask = find_col(aliases["ask"])
-    if col_ask is not None:
-        out["ask"] = pd.to_numeric(df[col_ask].map(_br_to_float), errors="coerce")
-    col_last = find_col(aliases["last"])
-    if col_last is not None:
-        out["last"] = pd.to_numeric(df[col_last].map(_br_to_float), errors="coerce")
+    c_bid = find_col(aliases["bid"])
+    if c_bid is not None:
+        out["bid"] = pd.to_numeric(df[c_bid].map(_br_to_float), errors="coerce")
+    c_ask = find_col(aliases["ask"])
+    if c_ask is not None:
+        out["ask"] = pd.to_numeric(df[c_ask].map(_br_to_float), errors="coerce")
+    c_last = find_col(aliases["last"])
+    if c_last is not None:
+        out["last"] = pd.to_numeric(df[c_last].map(_br_to_float), errors="coerce")
 
     # IV / Delta
-    col_iv = find_col(aliases["impliedVol"])
-    if col_iv is not None:
-        out["impliedVol"] = pd.to_numeric(df[col_iv].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
-    col_delta = find_col(aliases["delta"])
-    if col_delta is not None:
-        out["delta"] = pd.to_numeric(df[col_delta].map(_br_to_float), errors="coerce")
+    c_iv = find_col(aliases["impliedVol"])
+    if c_iv is not None:
+        out["impliedVol"] = pd.to_numeric(df[c_iv].map(lambda v: _br_to_float(v)/100.0), errors="coerce")
+    c_delta = find_col(aliases["delta"])
+    if c_delta is not None:
+        out["delta"] = pd.to_numeric(df[c_delta].map(_br_to_float), errors="coerce")
 
-    # MID robusto
+    # mid robusto
     bid_series  = out["bid"]  if "bid"  in out.columns else pd.Series(np.nan, index=df.index)
     ask_series  = out["ask"]  if "ask"  in out.columns else pd.Series(np.nan, index=df.index)
     last_series = out["last"] if "last" in out.columns else pd.Series(np.nan, index=df.index)
@@ -388,75 +335,66 @@ def _auto_read_opcoesnet(file) -> pd.DataFrame:
     mid_from_quotes = (bid_series.fillna(0) + ask_series.fillna(0)) / 2.0
     out["mid"] = np.where(has_quote, mid_from_quotes, last_series)
 
-    # expiration (por nome OU fallback por POSIÇÃO — coluna B)
-    col_exp = find_col(aliases["expiration"])
-    col_bdays = find_col(aliases["bdays"])
+    # expiration — por nome OU fallback COLUNA B
+    c_exp = find_col(aliases["expiration"])
+    c_bdays = find_col(aliases["bdays"])
     exp_series = None
-
-    if col_exp is not None:
-        exp_series = df[col_exp]
-    elif col_bdays is not None:
+    if c_exp is not None:
+        exp_series = df[c_exp]
+    elif c_bdays is not None:
         def _est(d):
             try:
                 n = int(_br_to_float(d))
                 return (pd.Timestamp(date.today()) + BDay(n)).date()
             except Exception:
                 return np.nan
-        out["expiration"] = df[col_bdays].map(_est)
+        out["expiration"] = df[c_bdays].map(_est)
     else:
-        # 👉 Fallback: usar a COLUNA B (segunda coluna) conforme você informou
-        try:
-            if df.shape[1] >= 2:
-                exp_series = df.iloc[:, 1]  # coluna B
-        except Exception:
-            exp_series = None
+        # fallback: coluna B (segunda)
+        if df.shape[1] >= 2:
+            exp_series = df.iloc[:, 1]
 
     if exp_series is not None:
         parsed = exp_series.map(_parse_date_any)
-        # checagem de qualidade: pelo menos 10% datas válidas
         valid_ratio = parsed.notna().mean() if len(parsed) else 0.0
         if valid_ratio >= 0.1:
             out["expiration"] = parsed
         else:
-            # última tentativa: tentar converter com dayfirst à força
             try:
                 forced = pd.to_datetime(exp_series.astype(str).str.strip(), dayfirst=True, errors="coerce").dt.date
                 out["expiration"] = forced
             except Exception:
                 out["expiration"] = np.nan
+    if "impliedVol" not in out.columns: out["impliedVol"] = np.nan
+    if "type" not in out.columns: out["type"] = np.nan
+    if "strike" not in out.columns: out["strike"] = np.nan
+    if "expiration" not in out.columns: out["expiration"] = np.nan
 
-    if "expiration" not in out.columns:
-        out["expiration"] = np.nan
-
-    # IV placeholder (fallback real via HV20 ocorre depois)
-    if "impliedVol" not in out.columns:
-        out["impliedVol"] = np.nan
-
-    # garantias mínimas
-    for c in ["type","strike","expiration"]:
-        if c not in out.columns: out[c] = np.nan
-
-    # Debug opcional
-    with st.expander("🛠️ Diagnóstico de leitura (opcional)"):
+    # Diag
+    with st.expander("🛠️ Diagnóstico de leitura"):
         st.write(f"Header usado: {header_used} (1 = linha 2, 0 = linha 1)")
-        st.write("Algumas colunas mapeadas:", list(out.columns))
-        st.write("Amostra (5 linhas):")
+        st.write("Colunas mapeadas:", list(out.columns))
+        if "type" in out.columns:
+            st.write("Contagem por type (bruto):", out["type"].value_counts(dropna=False))
+        if "strike" in out.columns:
+            st.write("Exemplo strikes:", out["strike"].dropna().head(5).tolist())
+        if "expiration" in out.columns:
+            st.write("Exemplo vencimentos:", out["expiration"].dropna().astype(str).head(5).tolist())
         st.dataframe(out.head())
 
     return out
 
+# ---- Lê arquivo ----
 try:
     chain_all = _auto_read_opcoesnet(uploaded)
 except Exception as e:
     st.error(f"Falha ao ler o arquivo: {e}")
     st.stop()
 
-# -------------------------------
-# Seleção de vencimento
-# -------------------------------
+# ---- Seleção vencimento ----
 valid_exps = sorted([d for d in chain_all["expiration"].dropna().unique().tolist() if isinstance(d, (date, datetime))])
 if not valid_exps:
-    st.error("Nenhum vencimento válido encontrado. Verifique o arquivo (coluna 'Vencimento' ou a coluna B).")
+    st.error("Nenhum vencimento válido encontrado. Verifique a coluna 'Vencimento' (ou a coluna B em dd/mm/aaaa).")
     st.stop()
 
 exp_choice = st.selectbox("📅 Vencimento", options=valid_exps, index=0)
@@ -464,43 +402,70 @@ T = yearfrac(date.today(), exp_choice if isinstance(exp_choice,date) else exp_ch
 days_to_exp = (exp_choice - date.today()).days if isinstance(exp_choice,date) else (exp_choice.date() - date.today()).days
 df = chain_all[chain_all["expiration"] == exp_choice].copy()
 
-# Preço médio (mid) e IV efetiva
+# ---- Completa 'type' por fallback strike vs. spot, se necessário ----
+if "type" not in df.columns or df["type"].isna().all():
+    # inferência pelo strike vs spot (apenas didática e suficiente para OTM)
+    t_guess = np.where(df["strike"] > spot, "C",
+               np.where(df["strike"] < spot, "P", np.nan))
+    df["type"] = t_guess
+
+# ---- IV efetiva ----
 if "impliedVol" not in df.columns:
     df["impliedVol"] = np.nan
 df["iv_eff"] = df["impliedVol"]
-if df["iv_eff"].isna().all():
+if df["iv_eff"].isna().all() or (df["iv_eff"]<=0).all():
     df["iv_eff"] = hv20
 
-# Separa OTM
-calls = df[(df["type"]=="C") & (df["strike"]>spot)].copy()
-puts  = df[(df["type"]=="P") & (df["strike"]<spot)].copy()
+# ---- Completa deltas se faltarem ----
+if "delta" not in df.columns:
+    df["delta"] = np.nan
+need = df["delta"].isna()
+if need.any():
+    vals = []
+    for _, row in df.loc[need].iterrows():
+        K = float(row["strike"])
+        sigma = float(row["iv_eff"]) if not pd.isna(row["iv_eff"]) and row["iv_eff"]>0 else hv20
+        sigma = max(sigma, 1e-6)
+        if str(row["type"]) == "C":
+            d = call_delta(spot, K, r, sigma, T)
+        elif str(row["type"]) == "P":
+            d = put_delta(spot, K, r, sigma, T)
+        else:
+            # se ainda não tiver tipo, use heurística rápida
+            d = call_delta(spot, K, r, sigma, T) if K>spot else put_delta(spot, K, r, sigma, T)
+        vals.append(d)
+    df.loc[need, "delta"] = vals
 
-# Completa Deltas se faltar
-for side_df, side in [(calls,"C"), (puts,"P")]:
-    if "delta" not in side_df.columns:
-        side_df["delta"] = np.nan
-    need = side_df["delta"].isna()
-    if need.any():
-        vals = []
-        for _, row in side_df.loc[need].iterrows():
-            K = float(row["strike"])
-            sigma = float(row["iv_eff"]) if not pd.isna(row["iv_eff"]) and row["iv_eff"]>0 else hv20
-            sigma = max(sigma, 1e-6)
-            d = call_delta(spot, K, r, sigma, T) if side=="C" else put_delta(spot, K, r, sigma, T)
-            vals.append(d)
-        side_df.loc[need, "delta"] = vals
+# ---- Seleção OTM (com fallback, mesmo que 'type' não venha correta) ----
+calls = df[(df["strike"]>spot) & (df["type"]=="C")].copy()
+puts  = df[(df["strike"]<spot) & (df["type"]=="P")].copy()
 
-# Filtro |Δ|
+# fallback: se não houver C/P suficientes, use apenas o critério do strike vs. spot
+if calls.empty:
+    calls = df[df["strike"]>spot].copy()
+    calls["type"] = "C"
+if puts.empty:
+    puts = df[df["strike"]<spot].copy()
+    puts["type"] = "P"
+
+# ---- Filtro |Δ| ----
 def dfilter(dfi: pd.DataFrame) -> pd.DataFrame:
-    if "delta" not in dfi.columns: return dfi
     dfo = dfi.copy()
+    if "delta" not in dfo.columns:
+        return dfo
     dfo["abs_delta"] = dfo["delta"].abs()
     dfo = dfo[(dfo["abs_delta"]>=delta_min) & (dfo["abs_delta"]<=delta_max)]
     return dfo
 
 calls = dfilter(calls); puts = dfilter(puts)
 
-# Prob ITM + bandas
+# ---- Diag pós-filtros ----
+with st.expander("🔎 Diagnóstico de filtros (OTM)"):
+    st.write(f"Calls OTM após filtros: {len(calls)} | Puts OTM após filtros: {len(puts)}")
+    if not calls.empty: st.write("Exemplo calls:", calls[["strike","mid","delta"]].head())
+    if not puts.empty:  st.write("Exemplo puts:",  puts[["strike","mid","delta"]].head())
+
+# ---- Probabilidades e bandas ----
 def probs(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
     df_side = df_side.copy()
     pr = []
@@ -514,8 +479,7 @@ def probs(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
     df_side["prob_ITM"] = pr
     return df_side
 
-calls = probs(calls, "C")
-puts  = probs(puts, "P")
+calls = probs(calls, "C"); puts = probs(puts, "P")
 
 bands = {"Baixo":(0.00,0.15), "Médio":(0.15,0.35), "Alto":(0.35,0.55)}
 def label_band(p):
@@ -526,34 +490,37 @@ def label_band(p):
 
 calls["band"] = calls["prob_ITM"].apply(label_band)
 puts["band"]  = puts["prob_ITM"].apply(label_band)
-calls = calls[calls["band"].isin(risk_selection)]
-puts  = puts[puts["band"].isin(risk_selection)]
+# (Se quiser limitar por seleção de bandas)
+# calls = calls[calls["band"].isin(risk_selection)]
+# puts  = puts[puts["band"].isin(risk_selection)]
 
-# Cobertura por ticker
+# ---- Cobertura ----
 st.markdown("### 4) Cobertura e tamanho do contrato")
 colA, colB, colC = st.columns(3)
 with colA:
     shares_owned = st.number_input(f"Ações em carteira ({TICKER})", min_value=0, step=100, value=0,
-                                   help="Quantidade de ações livres na carteira para cobrir as CALLs (1 lote = ‘Tamanho do contrato’).")
+        help="Ações livres para cobrir CALLs (1 lote = ‘Tamanho do contrato’).")
 with colB:
     cash_available = st.number_input(f"Caixa disponível (R$) ({TICKER})", min_value=0.0, step=100.0, value=10000.0, format="%.2f",
-                                     help="Dinheiro reservado para cobrir a PUT (compra ao strike × tamanho do contrato).")
+        help="Dinheiro reservado para cobrir a PUT (strike × tamanho do contrato).")
 with colC:
     lot_size = st.number_input(f"Tamanho do contrato ({TICKER})", min_value=1, step=1, value=100,
-                               help="Na B3, ações geralmente 100; use o valor do seu contrato.")
+        help="Na B3, ações geralmente 100; ajuste se o seu contrato for diferente.")
 
 max_qty_call = (shares_owned // lot_size) if lot_size > 0 else 0
 def max_qty_put_for_strike(Kp: float) -> int:
     if lot_size <= 0 or Kp <= 0: return 0
     return int(cash_available // (Kp * lot_size))
 
-# Combinação em strangles cobertos
+# ---- Montagem dos strangles cobertos ----
 combos = []
 for _, c in calls.iterrows():
     for _, p in puts.iterrows():
         Kc, Kp = float(c["strike"]), float(p["strike"])
         if not (Kp < spot < Kc): continue
-        mid_credit = float(c["mid"]) + float(p["mid"])
+        c_mid = float(c.get("mid", np.nan)); p_mid = float(p.get("mid", np.nan))
+        if np.isnan(c_mid) or np.isnan(p_mid): continue
+        mid_credit = c_mid + p_mid
         qty_call_cap = max_qty_call
         qty_put_cap  = max_qty_put_for_strike(Kp)
         qty = min(qty_call_cap if qty_call_cap>0 else 0, qty_put_cap if qty_put_cap>0 else 0)
@@ -578,7 +545,7 @@ for _, c in calls.iterrows():
         })
 
 if not combos:
-    st.warning("Não há strangles possíveis respeitando a cobertura (ações e caixa) com os filtros atuais.")
+    st.warning("Não há strangles possíveis com os filtros/limites atuais. Tente ampliar |Δ| ou conferir ‘mid’.")
     st.stop()
 
 combo_df = pd.DataFrame(combos)
@@ -586,7 +553,7 @@ combo_df["retorno_pct"] = combo_df["credit_total_por_contrato"] / spot
 combo_df["risk_score"] = (combo_df["probITM_call"] + combo_df["probITM_put"]) / 2.0
 combo_df["score_final"] = combo_df["retorno_pct"] / (combo_df["risk_score"] + 0.01)
 
-# Instruções de saída (didáticas)
+# ---- Instruções de saída ----
 def build_exit_guidance(row):
     Kc, Kp = row["K_call"], row["K_put"]
     credit = row["credit_total_por_contrato"]
@@ -603,11 +570,11 @@ def build_exit_guidance(row):
             msg.append("⚠️ CALL ameaçada: preço próximo de K_call.")
         elif near_put:
             msg.append("⚠️ PUT ameaçada: preço próximo de K_put.")
-        msg.append(f"🕐 Faltam {days_to_exp} d; regra didática: zerar o risco recomprando a perna ameaçada.")
-        msg.append("➡️ Ação: compre de volta a opção vendida (CALL ou PUT).")
+        msg.append(f"🕐 Faltam {days_to_exp} d; regra didática: recomprar a perna ameaçada.")
+        msg.append("➡️ Ação: compre de volta a CALL/PUT vendida.")
     else:
         msg.append("✅ Conforto: preço distante dos strikes ou ainda há tempo.")
-        msg.append("➡️ Ação: mantenha e monitore. Considere encerrar se capturar boa parte do prêmio.")
+        msg.append("➡️ Ação: manter e monitorar; encerrar se capturar boa parte do prêmio.")
     msg.append(f"💰 Meta: encerrar ao capturar {int(capture_target*100)}% do prêmio.")
     msg.append(f"🔧 Zeragem total (~): R$ {target_debit_both:.2f}/ação. Perna: ~ R$ {target_debit_per_leg:.2f}/ação.")
     return "  \n".join(msg), ("⚠️" if (time_critical and (near_call or near_put)) else "✅")
@@ -620,7 +587,7 @@ if show_exit_help:
     combo_df["Instrucao_saida"] = exit_texts
     combo_df["Alerta_saida"] = alerts
 
-# Top 3 e tabela
+# ---- Top 3 ----
 st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
 top3 = combo_df.sort_values(by=["score_final","credit_total_por_contrato"], ascending=[False,False]).head(3)
 display_cols = ["call_symbol","K_call","put_symbol","K_put","credit_total_por_contrato","poe_total","retorno_pct","score_final","qty","BE_low","BE_high"]
@@ -630,6 +597,7 @@ st.dataframe(top3[display_cols].rename(columns={
     "poe_total":"PoE_total","retorno_pct":"Retorno %","score_final":"Score"
 }).style.format({"K_call":"%.2f","K_put":"%.2f","Crédito/ação":"R$ %.2f","PoE_total":"{:.0%}","Retorno %":"{:.2%}","Score":"{:.2f}","BE_low":"R$ %.2f","BE_high":"R$ %.2f"}), use_container_width=True)
 
+# ---- Tabela completa ----
 st.subheader("📋 Sugestões ranqueadas")
 show_cols = ["ticker","call_symbol","K_call","probITM_call","delta_call",
              "put_symbol","K_put","probITM_put","delta_put",
@@ -651,7 +619,7 @@ st.dataframe(
     use_container_width=True
 )
 
-# Payoff (uma estrutura)
+# ---- Payoff (uma estrutura) ----
 st.markdown("### 📈 Payoff no Vencimento (P/L por ação)")
 combo_df["__id__"] = (
     combo_df["call_symbol"].astype(str) + " & " + combo_df["put_symbol"].astype(str) +
@@ -671,9 +639,7 @@ plt.title(f"{TICKER} — Payoff | Kp={Kp:.2f}, Kc={Kc:.2f}, Crédito≈R$ {credi
 plt.xlabel("Preço no vencimento (S)"); plt.ylabel("P/L por ação (R$)")
 st.pyplot(fig, use_container_width=True)
 
-# -------------------------------
-# v9 — Comparar Estratégias
-# -------------------------------
+# ---- Comparar Estratégias ----
 def _nearest_strike(df, typ, target, side):
     d = df[df["type"]==typ].copy()
     if d.empty: return None
@@ -716,7 +682,7 @@ with st.expander("📈 Comparar estratégias (Strangle × Iron Condor × Jade Li
     Kp_b, Kc_b, cred_b = float(rowb["K_put"]), float(rowb["K_call"]), float(rowb["credit_total_por_contrato"])
 
     wing_pct = st.slider("Largura das asas (% do preço à vista)", min_value=2, max_value=15, value=5, step=1,
-                         help="Define o quão distantes estarão as asas (PUT comprada e CALL comprada) do strangle base.") / 100.0
+                         help="Define a distância das asas (PUT comprada e CALL comprada) do strangle base.") / 100.0
     Kc_target = Kc_b + wing_pct * spot
     Kp_target = Kp_b - wing_pct * spot
     kc_w_tuple = _nearest_strike(df, 'C', Kc_target, side='above')
@@ -784,6 +750,4 @@ PoE_dentro = 1 − PoE_total. (Estimado por BS/Δ quando IV faltar.)
 - Curva = seu **P/L por ação** no vencimento para cada preço **S**.
 """)
 
-# -------------------------------
-# Fim
-# -------------------------------
+# ---- Fim ----
