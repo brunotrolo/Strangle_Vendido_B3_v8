@@ -274,7 +274,7 @@ def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
     # 2) HTML bruto sem render
     try:
         r = requests.get(url, headers=HEADERS, timeout=40)
-        tables = pd.read_html(r.text)
+        tables = pd.read_html(io.StringIO(r.text))
         if tables:
             df2 = _flatten_columns(max(tables, key=lambda t: t.shape[0]*t.shape[1]))
             df2 = normalize_chain_columns(df2)
@@ -287,7 +287,7 @@ def fetch_optionsnet(ticker_url: str) -> pd.DataFrame:
     try:
         alt = f"https://opcoes.net.br/opcoes2/bovespa?ativo={ticker_base}"
         rr = requests.get(alt, headers=HEADERS, timeout=40)
-        tables = pd.read_html(rr.text)
+        tables = pd.read_html(io.StringIO(rr.text))
         if tables:
             df3 = _flatten_columns(max(tables, key=lambda t: t.shape[0]*t.shape[1]))
             df3 = normalize_chain_columns(df3)
@@ -340,7 +340,7 @@ def fetch_b3_ticker_list() -> pd.DataFrame:
     url = "https://www.dadosdemercado.com.br/acoes"
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    tables = pd.read_html(r.text)
+    tables = pd.read_html(io.StringIO(r.text))
     if not tables:
         raise RuntimeError("Tabela de ações não encontrada na página.")
     df = max(tables, key=lambda t: t.shape[0] * t.shape[1]).copy()
@@ -415,6 +415,9 @@ if tickers_selected:
     tickers = tickers_selected
 else:
     tickers = [t.strip().upper() for t in re.split(r"[,\s]+", tickers_manual) if t.strip()]
+    # Remove itens inválidos e garantir sufixo .SA quando apropriado
+    tickers = [t for t in tickers if re.match(r'^[A-Z0-9]{3,6}(\.SA)?$', t)]
+
 
 if not tickers:
     st.info("Informe tickers manualmente ou carregue e selecione no catálogo.")
@@ -440,7 +443,9 @@ with st.expander("📘 Como interpretar (didático)", expanded=True):
 # ============================================================
 
 def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, lot_size: int):
-    yahoo_ticker = tk if tk.endswith(".SA") else f"{tk}.SA"
+    yahoo_ticker = tk if tk.endswith('.SA') else f'{tk}.SA'
+    if not re.match(r'^[A-Z0-9]{3,6}\.SA$', yahoo_ticker):
+        st.error(f"Ticker inválido: {tk}"); return None
     spot, hv20, iv_series = load_spot_and_iv_proxy(yahoo_ticker)
 
     m1, m2, m3 = st.columns(3)
@@ -689,7 +694,7 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
         st.dataframe(top3[display_cols].rename(columns={
             "call_symbol":"CALL","put_symbol":"PUT","credit_total_por_contrato":"Crédito/ação",
             "poe_total":"PoE_total","retorno_pct":"Retorno %","score_final":"Score"
-        }).style.format({"K_call":"%.2f","K_put":"%.2f","Crédito/ação":"R$ %.2f","PoE_total":"{:.0%}","Retorno %":"{:.2%}","Score":"{:.2f}","BE_low":"R$ %.2f","BE_high":"R$ %.2f"}), use_container_width=True)
+        }).style.format({"K_call":"%.2f","K_put":"%.2f","Crédito/ação":"R$ %.2f","PoE_total":"{:.0%}","Retorno %":"{:.2%}","Score":"{:.2f}","BE_low":"R$ %.2f","BE_high":"R$ %.2f"}), width='stretch')
     else:
         st.info("Sem combinações suficientes para ranquear o Top 3.")
 
@@ -721,7 +726,7 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
             "retorno_pct":"Retorno %","poe_total":"PoE_total","poe_inside":"PoE_dentro","score_final":"Score",
             "Instrucao_saida":"📘 Instrução de saída", "Alerta_saida":"Alerta"
         }).style.format(fmt),
-        use_container_width=True
+        width='stretch'
     )
 
     csv_bytes = result.to_csv(index=False).encode("utf-8")
@@ -749,7 +754,7 @@ def run_pipeline_for_ticker(tk: str, shares_owned: int, cash_available: float, l
     plt.title(f"{tk} — Payoff | Kp={Kp:.2f}, Kc={Kc:.2f}, Crédito≈R$ {credit:.2f}/ação")
     plt.xlabel("Preço do ativo no vencimento (S)")
     plt.ylabel("P/L por ação (R$)")
-    st.pyplot(fig, use_container_width=True)
+    st.pyplot(fig, width='stretch')
 
     with st.expander("🧭 Quando SAIR da operação? (didático)"):
         st.markdown(f"""
@@ -771,7 +776,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("**Requisitos para coleta JS (Chromium):** `pyppeteer`, `bs4`, `lxml`, `lxml_html_clean`  \nSe rodar em container/Cloud, garanta suporte a headless Chrome.")
 
-tabs = st.tabs(tickers if 'tickers' in globals() else ["PETR4.SA"])
+tabs = st.tabs(tickers if tickers else ['PETR4.SA']) else ["PETR4.SA"])
 
 if 'tickers' not in globals():
     tickers = ["PETR4.SA"]
