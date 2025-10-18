@@ -5,7 +5,7 @@
 # - Preço via yfinance (rotulado como "Strike" conforme pedido)
 # - HV20 (proxy) e r (anual) no menu lateral
 # - Colar a option chain (opcoes.net) e selecionar vencimento
-# - Sugestões (Top 3): tabela + cartões didáticos (Break-evens bonitos)
+# - Sugestões (Top 3): tabela + cartões didáticos (inclui prêmio PUT/CALL e total)
 # - Cálculos: crédito/ação, break-evens, PoE (Black–Scholes), prêmio total por lotes
 # ------------------------------------------------------------
 
@@ -348,7 +348,9 @@ for _, prow in puts_small.iterrows():
         kp = float(prow["strike"]); kc = float(crow["strike"])
         if not (kp < S < kc):
             continue
-        cred = float(prow["price"]) + float(crow["price"])
+        prem_put  = float(prow["price"])
+        prem_call = float(crow["price"])
+        cred = prem_put + prem_call
         be_low  = kp - cred
         be_high = kc + cred
         poe_p = float(prow["poe"]) if pd.notna(prow["poe"]) else np.nan
@@ -360,6 +362,8 @@ for _, prow in puts_small.iterrows():
             "CALL": crow["symbol"],
             "Kp": kp,
             "Kc": kc,
+            "premio_put": prem_put,
+            "premio_call": prem_call,
             "credito": cred,
             "be_low": be_low,
             "be_high": be_high,
@@ -377,19 +381,27 @@ pairs_df = pairs_df.sort_values(["score","credito"], ascending=[False, False]).r
 
 top3 = pairs_df.head(3).copy()
 
-# --- Tabela Top 3 (Break-evens bonitos) ---
+# --- Tabela Top 3 (com prêmio PUT, CALL e total) ---
 top3_display = top3.copy()
+top3_display["Prêmio PUT (R$)"]  = top3_display["premio_put"].map(lambda x: f"{x:.2f}")
+top3_display["Prêmio CALL (R$)"] = top3_display["premio_call"].map(lambda x: f"{x:.2f}")
 top3_display["Crédito/ação (R$)"] = top3_display["credito"].map(lambda x: f"{x:.2f}")
 top3_display["Break-evens (mín–máx)"] = top3_display.apply(lambda r: f"{r['be_low']:.2f} — {r['be_high']:.2f}", axis=1)
 top3_display["Prob. exercício PUT (%)"]  = (100*top3_display["poe_put"]).map(lambda x: f"{x:.1f}")
 top3_display["Prob. exercício CALL (%)"] = (100*top3_display["poe_call"]).map(lambda x: f"{x:.1f}")
-top3_display = top3_display[["PUT","Kp","CALL","Kc","Crédito/ação (R$)","Break-evens (mín–máx)","Prob. exercício PUT (%)","Prob. exercício CALL (%)"]]
+top3_display = top3_display[[
+    "PUT","Kp",
+    "CALL","Kc",
+    "Prêmio PUT (R$)","Prêmio CALL (R$)","Crédito/ação (R$)",
+    "Break-evens (mín–máx)",
+    "Prob. exercício PUT (%)","Prob. exercício CALL (%)"
+]]
 top3_display.rename(columns={"Kp":"Strike PUT","Kc":"Strike CALL"}, inplace=True)
 
 st.subheader("🏆 Top 3 (melhor prêmio/risco)")
 st.dataframe(top3_display, use_container_width=True, hide_index=True)
 
-# 8) Cartões detalhados
+# 8) Cartões detalhados (inalterados, exceto dependências das novas colunas que já existiam)
 st.markdown("—")
 st.subheader("📋 Recomendações detalhadas")
 
@@ -413,7 +425,6 @@ for i, rw in top3.iterrows():
         )
         c1, c2, c3 = st.columns([1.0, 1.2, 1.2])
         c1.metric("Crédito/ação", format_brl(rw["credito"]))
-        # Break-evens com rótulo limpo
         c2.metric("Break-evens (mín–máx)", f"{rw['be_low']:.2f} — {rw['be_high']:.2f}")
         c3.metric("Prob. exercício (PUT / CALL)", f"{100*rw['poe_put']:.1f}% / {100*rw['poe_call']:.1f}%")
 
