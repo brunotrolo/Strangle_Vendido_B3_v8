@@ -1,223 +1,227 @@
-# 💼 Strangle Vendido Coberto — Versão v9
-### 📈 Comparação de Estratégias: Strangle × Iron Condor × Jade Lizard
+# 💼 Strangle Vendido Coberto — v9
+
+> **App educacional e prático** para montar *strangles cobertos* na B3 com leitura de option chain, cálculo de prêmio/risco, probabilidades e recomendações didáticas.
+
+<p align="center">
+  <img alt="Streamlit" src="https://img.shields.io/badge/Streamlit-%F0%9F%8C%88-red?style=flat">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.11-blue?style=flat&logo=python">
+  <img alt="Market" src="https://img.shields.io/badge/Market-B3-black?style=flat">
+  <img alt="License" src="https://img.shields.io/badge/Use-Educacional-green?style=flat">
+</p>
 
 ---
 
 ## 🧭 Visão Geral
+O **Strangle Vendido Coberto — v9** é um aplicativo em **Python + Streamlit** para **investidores da B3 (Brasil)** que buscam **renda com controle de risco** vendendo **PUT + CALL OTM** (strangle) de forma **coberta**.  
+Você cola a *option chain* (opcoes.net.br), o app identifica vencimentos, filtra OTM, calcula **prêmio**, **break‑evens**, **PoE (prob. de exercício)** e entrega um **Top 3** claro e didático, com **regras de saída**.
 
-Este aplicativo ajuda investidores a **vender opções cobertas (CALL e PUT)** de forma inteligente e didática.  
-O foco é **maximizar a captura de prêmios** com **baixo risco de ser exercido**, simulando e comparando estratégias clássicas de renda com opções na B3 🇧🇷.
-
-A versão **v9** traz uma grande novidade:
-> A aba **📈 Comparar Estratégias**, que permite visualizar e comparar os resultados de **Strangle Vendido**, **Iron Condor Coberto** e **Jade Lizard** — com gráficos, métricas e explicações automáticas.
+> ⚠️ **Aviso**: projeto **didático**, não é recomendação de investimento.
 
 ---
 
-## ⚙️ Funcionalidades Principais
-
-| Recurso | Descrição |
-|----------|------------|
-| 🧾 **Leitura automática** | Coleta os dados de opções diretamente do site [opcoes.net.br](https://opcoes.net.br) |
-| 💰 **Cálculo de prêmios** | Mostra o valor dos prêmios, strikes e rentabilidade esperada |
-| 📊 **Probabilidades (PoE)** | Estima a probabilidade de exercício via modelo Black–Scholes |
-| ⚖️ **Classificação de risco** | Classifica cada operação em Baixo, Médio e Alto risco |
-| 📘 **Instruções automáticas de saída** | Explica quando e como sair da operação (recompra parcial, rolagem etc.) |
-| 📈 **Comparador de estratégias (v9)** | Exibe payoffs e métricas das três estruturas mais usadas por vendedores de opções |
-
----
-
-## 🚀 Como Usar
-
-1. **Escolha um ou mais tickers** (ex.: PETR4, VALE3, ITUB4).
-2. Informe:
-   - Quantidade de ações em carteira 💼  
-   - Caixa disponível 💵  
-   - Tamanho do contrato 📦 (geralmente 100)
-3. O app buscará a **opções chain** automaticamente.
-4. Selecione o **vencimento** desejado.
-5. Veja as sugestões de **Strangles vendidos cobertos** com:
-   - Prêmio total, retorno percentual, probabilidade de exercício e classificação de risco.
-6. Clique em **📈 Comparar Estratégias (v9)** para abrir o novo módulo.
+## ✨ Destaques
+- 📊 **Leitura automática** da planilha de opções (colar do opcoes.net.br)
+- 🧾 **Busca de tickers dinâmica** (ticker + nome) via dadosdemercado.com.br
+- 💹 **Preço à vista automático** via `yfinance`
+- 🔍 **Detecção de vencimentos** e separação por tipo (CALL/PUT)
+- 💰 **Cálculo de prêmio** (PUT + CALL, por ação e total)
+- 🧮 **Break‑evens** + **PoE** (modelo Black–Scholes)
+- 🧱 **Filtro OTM** e ranqueamento por **prêmio/risco**
+- 🏆 **Top 3** com explicações simples e regras práticas de saída
+- 💼 **Simulação de lotes** → mostra **prêmio total em R$**
 
 ---
 
-## 📈 Nova Aba — “Comparar Estratégias (v9)”
-
-Essa aba foi criada para te ajudar a **entender as diferenças práticas** entre 3 estruturas muito usadas na venda coberta de opções.
-
-### 🔸 1. Strangle Vendido Coberto
-
-- **Vende 1 PUT OTM + 1 CALL OTM**, ambas cobertas (caixa e ações).  
-- Ideal para **mercado lateral** e **IV alta**.  
-- **Lucro máximo**: prêmio recebido.  
-- **Risco**: ser exercido em um dos lados.  
-- **Melhor quando**: o ativo tende a oscilar dentro de uma faixa.
-
-🧮 **Payoff:**  
-`Lucro = +Prêmio – |Movimento fora dos strikes|`
-
----
-
-### 🔸 2. Iron Condor Coberto 🦅
-
-- Mesmo strangle vendido, **mas compra duas asas protetoras** (PUT e CALL mais distantes).  
-- Reduz o risco máximo e define **perda limitada**.  
-- Ideal para **mercado instável** ou quando o investidor quer dormir tranquilo 😴.  
-- **Lucro máximo**: prêmio líquido (menor que o strangle).  
-- **Perda máxima**: limitada à diferença entre strikes menos o crédito recebido.
-
-🧮 **Payoff:**  
-`Lucro = +Prêmio líquido – |Perda nas asas|`
+## 🔗 Sumário
+- [🧭 Visão Geral](#-visão-geral)
+- [✨ Destaques](#-destaques)
+- [🧮 Como o app calcula](#-como-o-app-calcula)
+- [📘 Glossário Rápido](#-glossário-rápido)
+- [🧩 Estruturas](#-estruturas)
+  - [Strangle Vendido Coberto](#strangle-vendido-coberto)
+  - [Iron Condor](#iron-condor)
+  - [Jade Lizard](#jade-lizard)
+- [🧰 Fluxo do App](#-fluxo-do-app)
+- [🏆 Top 3 — Como interpretar](#-top-3--como-interpretar)
+- [💡 Dicas de uso](#-dicas-de-uso)
+- [⚙️ Parâmetros (Sidebar)](#️-parâmetros-sidebar)
+- [🚀 Como rodar](#-como-rodar)
+- [🗺️ Roadmap](#️-roadmap)
+- [📚 Créditos](#-créditos)
 
 ---
 
-### 🔸 3. Jade Lizard 🦎
+## 🧮 Como o app calcula
 
-- Combina **venda de PUT + venda de CALL + compra de CALL mais OTM**.  
-- Mantém boa parte do prêmio da PUT e **elimina o risco de alta**, se o crédito ≥ diferença entre as CALLs.  
-- **Lucro máximo**: prêmio líquido.  
-- **Risco**: somente no lado da PUT.
+### 💰 Prêmio (por ação)
+```
+Crédito/ação = Prêmio PUT + Prêmio CALL
+```
 
-🧮 **Payoff:**  
-`Lucro = +Prêmio líquido – |Risco de queda|`
+### 📏 Break‑evens
+```
+Inferior  = Strike_PUT  – Crédito/ação
+Superior  = Strike_CALL + Crédito/ação
+```
 
----
+### 🎲 Probabilidade de Exercício (PoE)
+Modelo **Black–Scholes** (σ da cadeia quando disponível; HV20 como proxy):
+```
+CALL: PoE ≈ N(d2)      |  PUT: PoE ≈ N(−d2)
+d2 = [ ln(S/K) + (r − 0.5*σ²)*T ] / (σ*√T)
+```
 
-## 📊 Gráficos e Interpretação Visual
-
-Na aba de comparação, o app gera **3 gráficos de payoff**:
-
-| Cor / Linha | Representa |
-|--------------|-------------|
-| 🟦 Linha contínua | Lucro/Prejuízo por ação no vencimento |
-| ⚫ Linha tracejada vertical | Strikes de CALL e PUT |
-| 🟢 Zona central | Faixa de lucro máximo (entre os strikes) |
-| 🔴 Região abaixo/acima | Zonas de risco (exercício PUT ou CALL) |
-
-Você pode ajustar a **largura das asas (%)** para ver como muda o risco e o crédito das estruturas.
-
----
-
-## 💡 Dicas de Interpretação
-
-| Situação de Mercado | Estratégia Ideal | Motivo |
-|----------------------|------------------|---------|
-| 📉 Volatilidade alta e preço lateral | **Strangle Vendido** | Gera mais prêmio |
-| ⚖️ Volatilidade média e incerteza | **Iron Condor** | Limita risco e mantém renda |
-| 📈 Tendência leve de alta | **Jade Lizard** | Protege na alta e ainda gera prêmio |
-| 💥 IV muito baixa | Nenhuma venda | Prêmios ruins — espere melhores condições |
+### 💼 Prêmio total (R$)
+```
+Prêmio total = (Crédito/ação) × (Contrato=100) × (Lotes)
+```
 
 ---
 
-## 🧮 Métricas Calculadas
+## 📘 Glossário Rápido
 
-| Métrica | Descrição |
-|----------|------------|
-| **Retorno (%)** | Lucro potencial sobre o preço à vista |
-| **PoE_total** | Probabilidade de exercício (qualquer perna) |
-| **PoE_dentro** | Probabilidade de ficar entre os strikes |
-| **IV Rank / Percentil** | Nível relativo da volatilidade implícita |
-| **Score (prêmio/risco)** | Combina prêmio recebido e risco de exercício |
-
----
-
-## 📘 Instruções de Saída e Rolagem
-
-- ⚠️ **Perto do vencimento (≤ 10 dias)** e **preço encostando no strike (±5%)** → **Recomprar a perna ameaçada**.  
-- 💰 **Capturou 70–80% do prêmio?** → **Zere** a operação e evite tail risk.  
-- 🔄 **Quer manter a posição?** → **Role** para o próximo vencimento com strikes OTM.  
-
-🧩 O app mostra mensagens automáticas como:  
-> “⚠️ CALL ameaçada: preço próximo de K_call. Faltam 5 dias. Sugestão: recomprar a CALL e garantir 80% do prêmio.”
+| Sigla | Descrição |
+|---|---|
+| **S (Spot)** | Preço atual da ação (via yfinance) |
+| **Strike** | Preço de exercício da opção |
+| **IV** | Volatilidade implícita (quando disponível na cadeia) |
+| **HV20** | Volatilidade histórica anualizada (proxy) |
+| **PoE** | Prob. de exercício no vencimento (expirar ITM) |
+| **OTM/ITM** | Fora/Dentro do dinheiro |
+| **Contrato** | 100 ações na B3 |
 
 ---
 
-## 🧠 Glossário Didático
+## 🧩 Estruturas
 
-| Termo | Significado |
-|--------|--------------|
-| **Delta (Δ)** | Sensibilidade do preço da opção ao ativo subjacente |
-| **IV (Implied Volatility)** | Expectativa de volatilidade do mercado |
-| **IV Rank / Percentil** | Mede se a IV atual está alta ou baixa historicamente |
-| **PoE (Probabilidade de Exercício)** | Chance da opção terminar “dentro do dinheiro” |
-| **BE (Break-even)** | Pontos de equilíbrio — onde o lucro zera |
-| **Rolagem** | Substituir opção atual por outra mais distante no tempo |
-| **Strangle** | Venda simultânea de uma CALL e uma PUT OTM |
-| **Iron Condor** | Strangle com asas protetoras compradas |
-| **Jade Lizard** | PUT vendida + CALL vendida + CALL comprada mais OTM |
+### Strangle Vendido Coberto
+> Vende **1 PUT OTM** + **1 CALL OTM**.  
+> Melhor quando o mercado tende a **lateralizar** e IV está **elevada**.
+
+**Pontos‑chave**
+- Lucro máx. = **crédito recebido**
+- Risco: ser exercido em uma das pontas
+- Ajustes comuns: **rolagem** e **recompra** de uma perna
 
 ---
 
-## 🧰 Deploy Gratuito
+### Iron Condor
+> Strangle + asas (compra de PUT/CALL mais fora) → **perda máxima limitada**.
 
-### 🟣 **Streamlit Cloud**
-1. Faça login em [streamlit.io](https://streamlit.io/cloud).  
-2. Clique em “New app” → conecte seu GitHub → selecione o repositório.  
-3. Arquivo principal: `app_v9.py`  
-4. `requirements.txt` deve incluir:
-   ```
+**Pontos‑chave**
+- Lucro menor, risco **controlado**
+- Indicado p/ **volatilidade incerta**
+
+---
+
+### Jade Lizard
+> PUT vendida + CALL vendida + **CALL comprada** mais acima  
+> Se **crédito ≥ (K_call_comp − K_call_ven)** ⇒ **sem risco na alta**.
+
+**Pontos‑chave**
+- Mantém risco de **queda**
+- Útil se você **aceita** comprar as ações
+
+---
+
+## 🧰 Fluxo do App
+
+1) **Escolha o ticker** pelo nome OU código (lista dinâmica da B3)  
+2) **Preço à vista** do ativo via **yfinance** (automático)  
+3) **Cole** a planilha da *option chain* (opcoes.net.br)  
+4) **Selecione o vencimento** (detectado da planilha)  
+5) O app filtra **OTM**, calcula **prêmio/PoE/BE** e mostra o **Top 3**  
+6) Informe **lotes** para ver **prêmio total**
+
+> 💡 Se a cotação parecer defasada, recarregue a página (cache curto).
+
+---
+
+## 🏆 Top 3 — Como interpretar
+
+| Coluna | Explicação |
+|---|---|
+| **PUT / CALL** | Códigos das opções sugeridas |
+| **Strike (R$)** | Strike da PUT e CALL |
+| **Prêmio PUT / CALL (R$)** | Valor unitário de cada perna |
+| **Crédito/ação (R$)** | **Prêmio PUT + CALL**, por ação |
+| **Break‑evens (mín–máx)** | Faixa de preço onde o P/L ≥ 0 no vencimento |
+| **PoE PUT / CALL (%)** | Probabilidade estimada de exercício (queda/subida) |
+
+> **Regras práticas de saída**  
+> ⏳ faltam ≤ 7 dias → atenção redobrada  
+> 📈 se **S** encostar no **Strike da CALL**, **recomprar a CALL**  
+> 🎯 ao capturar **~75% do crédito**, **encerrar**
+
+---
+
+## 💡 Dicas de uso
+
+| Situação | Preferir |
+|---|---|
+| Mercado lateral + IV alta | **Strangle** |
+| Alta incerteza de volatilidade | **Iron Condor** |
+| Viés de alta moderada | **Jade Lizard** |
+| IV muito baixa | **Evitar vender** |
+
+---
+
+## ⚙️ Parâmetros (Sidebar)
+
+- **HV20 (σ anual – proxy)**: usada quando a IV não está disponível
+- **r (anual)**: taxa livre de risco (aprox. SELIC)
+- **Ações em carteira** e **Caixa**: definem cobertura
+- **Tamanho do contrato**: 100 (B3)
+- **Dias até vencimento (alerta)** e **Meta de captura do prêmio**
+
+---
+
+## 🚀 Como rodar
+
+### Local (Windows/macOS/Linux)
+```bash
+pip install -U streamlit yfinance pandas numpy requests beautifulsoup4 lxml
+streamlit run app_v9.py
+```
+
+### Streamlit Cloud
+1. Conecte seu repositório (com `app_v9.py` na raiz)
+2. Defina o arquivo principal: `app_v9.py`
+3. `requirements.txt` sugerido:
+   ```txt
    streamlit
-   requests
    yfinance
    pandas
    numpy
-   matplotlib
-   bs4
+   requests
+   beautifulsoup4
    lxml
-   pyppeteer
-   requests-html
-   nest_asyncio
    ```
-
-### 🟢 **Deta Space (alternativa com banco local)**
-Ideal para salvar histórico das operações e futuras notificações.  
-- Faça login em [deta.space](https://deta.space).  
-- Publique o projeto via terminal com:
-  ```bash
-  deta new --python
-  deta deploy
-  ```
-- Armazene suas operações vendidas e resultados.
+4. Deploy 🚀
 
 ---
 
-## 🧩 Versão Atual
-
-| Versão | Novidades |
-|---------|------------|
-| **v8** | Instruções automáticas de saída e alertas de exercício |
-| **v9** | Nova aba de comparação 📈 Strangle × Iron Condor × Jade Lizard |
-
----
-
-## ✨ Exemplo Prático — PETR4
-
-> PETR4 a R$ 38,00  
-> Strangle: CALL 40 / PUT 36  
-> Iron Condor: CALL 41 / PUT 35 (asas)  
-> Jade Lizard: PUT 36 / CALL 40 + CALL 41
-
-| Estratégia | Crédito | Risco Máx | Prob. Ficar Dentro |
-|-------------|----------|------------|---------------------|
-| Strangle | R$ 1,20 | Ilimitado | 72% |
-| Iron Condor | R$ 0,90 | R$ 0,90 | 70% |
-| Jade Lizard | R$ 1,10 | R$ 1,10 (queda) | 71% |
-
-**Conclusão:** Jade Lizard oferece **proteção de alta** e **bom prêmio**, sendo ideal se o investidor já tem posição comprada.
+## 🗺️ Roadmap
+- 🔔 **Alertas automáticos** (Telegram/e-mail)
+- 🧰 **Histórico** de operações (log + export)
+- 🎲 **Monte Carlo** para PoE dinâmico
+- 🤖 **ML** (XGBoost/LSTM) para sinais de reversão
+- 🔌 Integrações (Salesforce Flow / APIs)
 
 ---
 
-## 🧩 Conclusão
+## 📚 Créditos
+Projeto didático com inspiração em práticas de educação financeira no Brasil e fundamentos de **finanças quantitativas** (Black–Scholes, gregos, IV/HV).  
+**Stack**: Python 3.11 · Streamlit · yfinance · pandas/numpy · bs4/lxml.
 
-> A versão **v9** transforma o app em uma **ferramenta de aprendizado interativo** sobre venda coberta de opções na B3.
-
-Ela não só mostra o **melhor Strangle**, mas **ensina o porquê**, comparando outras estruturas que **reduzem risco e mantêm rentabilidade**.  
-Use o app como **laboratório de aprendizado e tomada de decisão disciplinada**.
-
-📘 Desenvolvido para investidores que desejam unir **estratégia, segurança e didática.**
+> **Autor(es)**: ChatGPT + Colaborador(a)  
+> **Licença**: Uso educacional — sem garantia, sem recomendação de investimento.
 
 ---
 
-🛠️ **Autor:** ChatGPT (colaboração com Bruno Teixeira)  
-📅 **Versão:** 9.0  
-📍 **Mercado-alvo:** B3 – Brasil, opções cobertas (PETR4, VALE3, ITUB4, CSAN3, etc.)
+### 🧷 Anexos úteis
+- Site para colar a cadeia: https://opcoes.net.br  
+- Lista de ações da B3: https://www.dadosdemercado.com.br/acoes
+- API de preços: `yfinance`
+
+> Dúvidas, ideias ou PRs são muito bem‑vindos! 😉
