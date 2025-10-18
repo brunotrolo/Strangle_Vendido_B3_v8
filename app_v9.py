@@ -27,13 +27,31 @@ st.set_page_config(page_title="Strangle Vendido Coberto — v9", page_icon="💼
 # CSS para melhorar legibilidade de títulos/strike
 st.markdown("""
 <style>
+/* Tipografia geral dos títulos */
 .big-title {font-size:1.15rem; font-weight:700; margin: 0 0 .25rem 0;}
-.small-help {color:#6b7280; font-size:.95rem; margin: 0 0 .5rem 0;}
-.strike-card{padding:.75rem 1rem; border:1px solid #e5e7eb; border-radius:12px; background:#fafafa;}
-.strike-label{font-size:.95rem; color:#6b7280; margin-bottom:.15rem;}
+.small-help {color:var(--text-color-secondary, #6b7280); font-size:.95rem; margin: 0 0 .5rem 0;}
+
+/* Cartão do Strike responsivo a light/dark */
+.strike-card{padding:.75rem 1rem; border:1px solid; border-radius:12px;}
+.strike-label{font-size:.95rem; margin-bottom:.15rem; opacity:.85;}
 .strike-value{font-size:1.6rem; font-weight:800;}
+
+/* Light mode (claro) */
+@media (prefers-color-scheme: light) {
+  .strike-card{ background:#fafafa; border-color:#e5e7eb; }
+  .strike-label{ color:#4b5563; }   /* slate-600 */
+  .strike-value{ color:#111827; }   /* gray-900 */
+}
+
+/* Dark mode (escuro) */
+@media (prefers-color-scheme: dark) {
+  .strike-card{ background:#111827; border-color:#374151; } /* gray-900 / gray-700 */
+  .strike-label{ color:#d1d5db; }   /* gray-300 */
+  .strike-value{ color:#f9fafb; }   /* gray-50  */
+}
 </style>
 """, unsafe_allow_html=True)
+
 
 CONTRACT_SIZE = 100  # tamanho padrão de contrato B3
 CACHE_TTL = 300      # 5 minutos
