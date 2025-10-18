@@ -160,7 +160,7 @@ def _format_money(v):
 def fetch_b3_universe():
     """
     Lê listas da Wikipédia PT e retorna DataFrame com colunas:
-    ['ticker', 'name'] (ticker sem .SA), sem duplicatas.
+    ['ticker', 'name', 'label'] (ticker sem .SA), sem duplicatas.
     """
     urls = [
         "https://pt.wikipedia.org/wiki/Lista_de_companhias_listadas_na_B3",
@@ -175,15 +175,12 @@ def fetch_b3_universe():
         except Exception:
             continue
         for tb in tables:
-            # normalizar
             tbc = tb.copy()
             tbc.columns = _normalize_header([str(c) for c in tbc.columns])
             cols = list(tbc.columns)
 
-            # achar coluna do ticker
             tick_cols = [c for c in cols if re.search(r"(symbol|ticker|c[oó]digo|negocia)", c, flags=re.I)]
             name_cols = [c for c in cols if re.search(r"(name|empresa|raz[aã]o)", c, flags=re.I)]
-
             if not tick_cols:
                 continue
             tcol = tick_cols[0]
@@ -191,23 +188,20 @@ def fetch_b3_universe():
 
             ser_tk = tbc[tcol].astype(str).str.upper().str.strip()
             ser_tk = ser_tk.str.replace(r"[^A-Z0-9]", "", regex=True)
-            # formato típico: 4 letras + 1–2 dígitos (incluindo 11, 33, 34…)
             ser_tk = ser_tk[ser_tk.str.match(r"^[A-Z]{4}[0-9]{1,2}$")]
 
-            if ncol and ncol in tbc.columns:
-                ser_nm = tbc[ncol].astype(str).str.strip()
-            else:
-                ser_nm = pd.Series([""] * len(ser_tk), index=ser_tk.index)
+            ser_nm = (tbc[ncol].astype(str).str.strip() if ncol and ncol in tbc.columns
+                      else pd.Series([""] * len(ser_tk), index=ser_tk.index))
 
             for idx in ser_tk.index:
                 tk = ser_tk.loc[idx]
                 nm = ser_nm.loc[idx] if idx in ser_nm.index else ""
-                key = (tk, nm)
                 if tk not in seen:
                     seen.add(tk)
                     records.append({"ticker": tk, "name": nm})
 
     if not records:
+        # fallback mínimo
         records = [
             {"ticker":"PETR4","name":"Petrobras"},
             {"ticker":"VALE3","name":"Vale"},
@@ -218,9 +212,9 @@ def fetch_b3_universe():
             {"ticker":"WEGE3","name":"WEG"},
         ]
     dfu = pd.DataFrame(records).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
-    # monta label para procurar por nome
+    dfu["name"] = dfu["name"].fillna("").astype(str)
     dfu["label"] = np.where(
-        dfu["name"].fillna("").str.len()>0,
+        dfu["name"].str.len()>0,
         dfu["ticker"] + " — " + dfu["name"],
         dfu["ticker"]
     )
@@ -261,54 +255,69 @@ df_b3 = fetch_b3_universe()
 colA, colB = st.columns([1.6,1.0])
 with colA:
     st.markdown("#### 🔎 Escolha um ticker da B3 (pesquise por **nome** ou **código**)")
-    # selectbox mostra "TICKER — Nome", e permite procurar digitando o nome
-    sel_label = st.selectbox(
-        "Pesquisar",
-        options=df_b3["label"].tolist(),
-        index=(df_b3.index[df_b3["ticker"]=="PETR4"][0] if "PETR4" in df_b3["ticker"].values else 0),
-        placeholder="Digite 'Bradesco', 'Petrobras', etc."
-    )
-    sel_row = df_b3[df_b3["label"] == sel_label].iloc[0]
-    sel = sel_row["ticker"]
+    options = df_b3["label"].tolist() if df_b3 is not None and not df_b3.empty else []
+    # índice seguro
+    default_idx = 0
+    if options:
+        try:
+            if "PETR4" in df_b3["ticker"].values:
+                default_idx = int(np.where(df_b3["ticker"].values == "PETR4")[0][0])
+            else:
+                default_idx = 0
+        except Exception:
+            default_idx = 0
+        default_idx = min(max(default_idx, 0), len(options)-1)
+        sel_label = st.selectbox(
+            "Pesquisar",
+            options=options,
+            index=default_idx,
+            placeholder="Digite 'Bradesco', 'Petrobras', etc.",
+            key="ticker_select"
+        )
+        sel_row = df_b3[df_b3["label"] == sel_label].iloc[0]
+        sel = sel_row["ticker"]
+    else:
+        st.warning("Não consegui carregar a lista da B3. Digite o ticker manualmente abaixo.")
+        sel = st.text_input("Ticker (ex.: PETR4, BBDC4)", value="PETR4", key="ticker_fallback").upper().strip()
+
 with colB:
-    auto_price = st.toggle("Usar cotação automática (Yahoo Finance)", value=True)
+    auto_price = st.toggle("Usar cotação automática (Yahoo Finance)", value=True, key="use_yf")
     if auto_price:
         px = yahoo_price_b3(sel)
         if px is None:
             st.warning("Não consegui obter o preço no Yahoo. Informe manualmente no campo abaixo.")
     else:
         px = None
-    spot_input = st.text_input("Preço à vista (S)", value=(f"{px:.2f}".replace(".", ",") if px else ""))
+    spot_input = st.text_input("Preço à vista (S)", value=(f"{px:.2f}".replace(".", ",") if px else ""), key="spot")
     spot = _br_to_float(spot_input) if spot_input else (px if px else np.nan)
 
 # ========================= Sidebar =========================
 st.sidebar.header("⚙️ Parâmetros")
-# HV20 e r agora no menu lateral
-hv20_pct = st.sidebar.number_input("HV20 (σ anual – %)", min_value=0.0, max_value=200.0, value=17.12, step=0.10)
-r_anual_pct = st.sidebar.number_input("r (anual – %)", min_value=0.0, max_value=100.0, value=11.00, step=0.25)
+hv20_pct = st.sidebar.number_input("HV20 (σ anual – %)", min_value=0.0, max_value=200.0, value=17.12, step=0.10, key="hv20")
+r_anual_pct = st.sidebar.number_input("r (anual – %)", min_value=0.0, max_value=100.0, value=11.00, step=0.25, key="r_anual")
 
 st.sidebar.markdown("##### Filtros de moneyness")
-mindelta = st.sidebar.number_input("|Δ| mínimo", min_value=0.00, max_value=1.00, step=0.01, value=0.05,
+mindelta = st.sidebar.number_input("|Δ| mínimo", min_value=0.00, max_value=1.00, step=0.01, value=0.05, key="mindelta",
     help="Filtro de moneyness por |Δ| (aprox. prob. de ficar ITM). Ex.: 0,05 = 5%.")
-maxdelta = st.sidebar.number_input("|Δ| máximo", min_value=0.00, max_value=1.00, step=0.01, value=0.35,
+maxdelta = st.sidebar.number_input("|Δ| máximo", min_value=0.00, max_value=1.00, step=0.01, value=0.35, key="maxdelta",
     help="Filtro superior de |Δ|. Vendedores costumam usar ~0,05–0,35.")
 
 st.sidebar.markdown("##### Bandas de risco por perna")
-b_baixo = st.sidebar.slider("Faixa Baixo (0–X%)", min_value=0, max_value=55, value=15,
+b_baixo = st.sidebar.slider("Faixa Baixo (0–X%)", min_value=0, max_value=55, value=15, key="band_baixo",
     help="Prob. ITM ≈ |Δ| × 100. Até aqui: **Baixo**.")
-b_medio = st.sidebar.slider("Faixa Médio (X–Y%)", min_value=b_baixo, max_value=55, value=35,
+b_medio = st.sidebar.slider("Faixa Médio (X–Y%)", min_value=b_baixo, max_value=55, value=35, key="band_medio",
     help="Até aqui: **Médio**. Acima de Y: **Alto**.")
 bands_cfg = {"Baixo": (0, b_baixo), "Médio": (b_baixo, b_medio), "Alto": (b_medio, 55)}
 
 st.sidebar.markdown("##### Instruções de SAÍDA — Regras práticas")
-dte_alert = st.sidebar.number_input("Dias até vencimento (alerta)", min_value=0, max_value=60, value=7)
-prox_pct = st.sidebar.number_input("Proximidade ao strike (%)", min_value=0.0, max_value=20.0, value=1.0, step=0.1)
-take_profit = st.sidebar.number_input("Meta de captura do prêmio (%)", min_value=10, max_value=95, value=75, step=5)
+dte_alert = st.sidebar.number_input("Dias até vencimento (alerta)", min_value=0, max_value=60, value=7, key="dte_alert")
+prox_pct = st.sidebar.number_input("Proximidade ao strike (%)", min_value=0.0, max_value=20.0, value=1.0, step=0.1, key="prox_pct")
+take_profit = st.sidebar.number_input("Meta de captura do prêmio (%)", min_value=10, max_value=95, value=75, step=5, key="tp_pct")
 
 st.sidebar.markdown("##### Cobertura")
-contract_size = st.sidebar.number_input("Tamanho do contrato", min_value=1, max_value=1000, value=100)
-qty_shares = st.sidebar.number_input(f"Ações em carteira ({sel})", min_value=0, max_value=1_000_000, value=0)
-cash_avail = st.sidebar.text_input(f"Caixa disponível (R$) ({sel})", value="10.000,00")
+contract_size = st.sidebar.number_input("Tamanho do contrato", min_value=1, max_value=1000, value=100, key="contract_size")
+qty_shares = st.sidebar.number_input(lambda: f"Ações em carteira ({sel})", min_value=0, max_value=1_000_000, value=0, key="qty_shares")
+cash_avail = st.sidebar.text_input(lambda: f"Caixa disponível (R$) ({sel})", value="10.000,00", key="cash_avail")
 cash_avail = _br_to_float(cash_avail)
 
 # ========================= Colar option chain =========================
@@ -326,13 +335,19 @@ if raw.strip():
     except Exception:
         lines = [ln for ln in raw.splitlines() if ln.strip()]
         rows = [re.split(r"\t|[ ]{2,}", ln.strip()) for ln in lines]
-        df_raw = pd.DataFrame(rows[1:], columns=rows[0])
-    df = _clean_dataframe(df_raw)
+        if not rows:
+            df_raw = pd.DataFrame()
+        else:
+            header = rows[0]
+            body = rows[1:] if len(rows) > 1 else []
+            df_raw = pd.DataFrame(body, columns=header)
+    if not df_raw.empty:
+        df = _clean_dataframe(df_raw)
 
 if df is not None and not df.empty:
     exps = sorted(df["expiration"].dropna().unique().tolist())
     st.markdown("### 📅 Vencimento")
-    chosen_exp = st.selectbox("Escolha um vencimento:", options=exps)
+    chosen_exp = st.selectbox("Escolha um vencimento:", options=exps, key="exp_select")
 
     df_exp = df[df["expiration"] == chosen_exp].copy()
 
@@ -428,7 +443,7 @@ if df is not None and not df.empty:
             base = top3.iloc[0] if not top3.empty else dfc.iloc[0]
             Kp, Kc = base["K_put"], base["K_call"]
             credito = base["Crédito num"]
-            asas_pct = st.slider("Largura das asas (% do preço à vista)", 2, 15, 8)
+            asas_pct = st.slider("Largura das asas (% do preço à vista)", 2, 15, 8, key="asas")
             asa_abs = (asas_pct/100.0)*spot
             Kp_w = max(0.01, Kp - asa_abs)
             Kc_w = Kc + asa_abs
