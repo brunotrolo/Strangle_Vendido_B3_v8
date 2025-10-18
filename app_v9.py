@@ -2,11 +2,10 @@
 # ------------------------------------------------------------
 # Strangle Vendido Coberto — v9
 # - Lista de tickers da B3 (dadosdemercado.com.br) com busca por nome/código
-# - Preço via yfinance (rotulado como "Strike" conforme pedido)
+# - Preço via yfinance mostrado como "Strike" (somente leitura, grande)
 # - HV20 (proxy) e r (anual) no menu lateral
 # - Colar a option chain (opcoes.net) e selecionar vencimento
 # - Sugestões (Top 3): tabela + cartões didáticos (inclui prêmio PUT/CALL e total)
-# - Cálculos: crédito/ação, break-evens, PoE (Black–Scholes), prêmio total por lotes
 # ------------------------------------------------------------
 
 import streamlit as st
@@ -24,6 +23,17 @@ import math
 # Configuração básica
 # -------------------------
 st.set_page_config(page_title="Strangle Vendido Coberto — v9", page_icon="💼", layout="wide")
+
+# CSS para melhorar legibilidade de títulos/strike
+st.markdown("""
+<style>
+.big-title {font-size:1.15rem; font-weight:700; margin: 0 0 .25rem 0;}
+.small-help {color:#6b7280; font-size:.95rem; margin: 0 0 .5rem 0;}
+.strike-card{padding:.75rem 1rem; border:1px solid #e5e7eb; border-radius:12px; background:#fafafa;}
+.strike-label{font-size:.95rem; color:#6b7280; margin-bottom:.15rem;}
+.strike-value{font-size:1.6rem; font-weight:800;}
+</style>
+""", unsafe_allow_html=True)
 
 CONTRACT_SIZE = 100  # tamanho padrão de contrato B3
 CACHE_TTL = 300      # 5 minutos
@@ -236,31 +246,35 @@ st.title("💼 Strangle Vendido Coberto — v9")
 st.caption("Cole a option chain do opcoes.net, escolha o vencimento e veja as sugestões didáticas de strangle coberto.")
 
 # 1) Seleção de ticker por nome/código
-with st.container():
-    st.subheader("🔎 Escolha um ticker da B3 (pesquise por nome ou código)")
-    tickers_df = fetch_b3_tickers()
-    if tickers_df.empty:
-        st.warning("Não consegui carregar a lista de tickers agora. Digite o código manualmente no campo abaixo.")
-        user_ticker = st.text_input("Ticker da B3", value="PETR4")
-    else:
-        tickers_df["label"] = tickers_df["ticker"] + " — " + tickers_df["empresa"]
-        default_idx = int((tickers_df["ticker"] == "PETR4").idxmax()) if "PETR4" in set(tickers_df["ticker"]) else 0
-        sel_label = st.selectbox(
-            "Selecione pelo nome da empresa ou ticker",
-            options=tickers_df["label"].tolist(),
-            index=default_idx if default_idx is not None else 0,
-            help="Digite para pesquisar por nome ou código."
-        )
-        sel_row = tickers_df.loc[tickers_df["label"] == sel_label].iloc[0]
-        user_ticker = sel_row["ticker"]
+st.markdown('<div class="big-title">🔎 Selecione pelo nome da empresa ou ticker</div><div class="small-help">Digite para pesquisar por nome ou código.</div>', unsafe_allow_html=True)
+tickers_df = fetch_b3_tickers()
+if tickers_df.empty:
+    st.warning("Não consegui carregar a lista de tickers agora. Digite o código manualmente no campo abaixo.")
+    user_ticker = st.text_input("Ticker da B3", value="PETR4")
+else:
+    tickers_df["label"] = tickers_df["ticker"] + " — " + tickers_df["empresa"]
+    default_idx = int((tickers_df["ticker"] == "PETR4").idxmax()) if "PETR4" in set(tickers_df["ticker"]) else 0
+    sel_label = st.selectbox(
+        " ",  # label vazio (mostramos nosso título customizado acima)
+        options=tickers_df["label"].tolist(),
+        index=default_idx if default_idx is not None else 0,
+        help="",
+        label_visibility="collapsed"
+    )
+    sel_row = tickers_df.loc[tickers_df["label"] == sel_label].iloc[0]
+    user_ticker = sel_row["ticker"]
 
-# 2) Preço via yfinance (rótulo pedido: 'Strike')
+# 2) Preço via yfinance mostrado como STRIKE grande (somente leitura)
 y_ticker = yahoo_symbol_from_b3(user_ticker)
 spot, hv20_auto = fetch_yf_price_and_hv20(y_ticker)
 
-colA = st.columns([1])[0]
-with colA:
-    st.number_input("Strike", value=float(spot) if pd.notna(spot) else 0.0, step=0.01, format="%.2f", disabled=True)
+strike_html = f"""
+<div class="strike-card">
+  <div class="strike-label">Strike (preço à vista via yfinance)</div>
+  <div class="strike-value">{format_brl(spot)}</div>
+</div>
+"""
+st.markdown(strike_html, unsafe_allow_html=True)
 
 # 3) Sidebar: parâmetros (HV20, r) e cobertura
 st.sidebar.header("⚙️ Parâmetros & Cobertura")
@@ -284,7 +298,11 @@ meta_captura = st.sidebar.number_input("Meta de captura do crédito (%)", min_va
 
 # 4) Colar a option chain
 st.subheader(f"3) Colar a option chain de {user_ticker} (opcoes.net)")
-pasted = st.text_area("Cole aqui a tabela (Ctrl/Cmd+C no site → Ctrl/Cmd+V aqui)", height=220, help="A tabela precisa conter: Ticker, Vencimento, Tipo (CALL/PUT), Strike, Último, (opcional) Vol. Impl. (%), Delta.")
+pasted = st.text_area(
+    "Cole aqui a tabela (Ctrl/Cmd+C no site → Ctrl/Cmd+V aqui)",
+    height=220,
+    help="A tabela precisa conter: Ticker, Vencimento, Tipo (CALL/PUT), Strike, Último, (opcional) Vol. Impl. (%), Delta."
+)
 
 df_chain = parse_pasted_chain(pasted)
 if df_chain.empty:
@@ -381,7 +399,7 @@ pairs_df = pairs_df.sort_values(["score","credito"], ascending=[False, False]).r
 
 top3 = pairs_df.head(3).copy()
 
-# --- Tabela Top 3 (com prêmio PUT, CALL e total) ---
+# --- Tabela Top 3 (inclui prêmio PUT, CALL e total) ---
 top3_display = top3.copy()
 top3_display["Prêmio PUT (R$)"]  = top3_display["premio_put"].map(lambda x: f"{x:.2f}")
 top3_display["Prêmio CALL (R$)"] = top3_display["premio_call"].map(lambda x: f"{x:.2f}")
@@ -401,7 +419,7 @@ top3_display.rename(columns={"Kp":"Strike PUT","Kc":"Strike CALL"}, inplace=True
 st.subheader("🏆 Top 3 (melhor prêmio/risco)")
 st.dataframe(top3_display, use_container_width=True, hide_index=True)
 
-# 8) Cartões detalhados (inalterados, exceto dependências das novas colunas que já existiam)
+# 8) Cartões detalhados (mantidos)
 st.markdown("—")
 st.subheader("📋 Recomendações detalhadas")
 
