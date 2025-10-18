@@ -4,14 +4,13 @@
 # - Busca dinâmica de tickers na B3 (dadosdemercado.com.br/acoes)
 # - Cotação automática via yfinance (sempre)
 # - Input para colar option chain do opcoes.net
-# - TOP3 em tabela + blocos explicativos c/ lotes e prêmio estimado
+# - TOP3 em tabela + blocos explicativos c/ lotes e prêmio estimado (métrica + fórmula)
 # - Parser robusto (dedup de colunas e primeira ocorrência)
 # --------------------------------------------
 
 import re
 import io
 import math
-import json
 import numpy as np
 import pandas as pd
 import requests
@@ -57,6 +56,9 @@ def _parse_money_ptbr(x):
 
 def yearfrac(d1: date, d2: date) -> float:
     return max((d2 - d1).days, 0) / 365.0
+
+def format_brl(x: float) -> str:
+    return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 # ---------------- Dados de Tickers (B3) ----------------
 
@@ -258,8 +260,8 @@ def prob_ITM_put(S,K,r,sigma,T):
 # ---------------- App ----------------
 
 st.set_page_config(page_title="Strangle Vendido Coberto — v9", page_icon="💼", layout="wide")
-st.markdown("## 💼 Strangle Vendido Coberto — v9 (colar tabela do opcoes.net)")
-st.caption("Cole a option chain do opcoes.net, escolha o vencimento e veja as sugestões didáticas de strangle coberto e a comparação de estratégias.")
+st.markdown("## 💼 Strangle Vendido Coberto — v9")
+st.caption("Cole a option chain do opcoes.net, escolha o vencimento e veja as sugestões didáticas de strangle coberto.")
 
 with st.sidebar:
     st.markdown("### ⚙️ Parâmetros")
@@ -277,6 +279,7 @@ with st.sidebar:
     prox_pct = st.number_input("Proximidade ao strike (%)", min_value=0.0, max_value=20.0, value=1.0, step=0.5)
     meta_captura = st.number_input("Meta de captura do prêmio (%)", min_value=10, max_value=100, value=75, step=5)
 
+# -------- Tickers --------
 df_tks, warn_msg = get_ticker_list_for_select()
 if warn_msg:
     st.info(warn_msg)
@@ -288,6 +291,7 @@ sel_label = st.selectbox("Ticker (B3) — pesquise por nome ou código", options
                          index=default_idx if 0 <= default_idx < len(options_labels) else 0)
 sel = sel_label.split(" — ")[0].strip()
 
+# -------- Preço à vista (sempre yfinance) --------
 spot = get_spot_from_yf(sel)
 if spot is None:
     st.warning("⚠️ Não consegui obter a cotação via yfinance. Informe manualmente.")
@@ -295,6 +299,7 @@ if spot is None:
 else:
     st.metric("Preço à vista (S)", f"{spot:,.2f}".replace(",", "X").replace(".", ",").replace("X","."))
 
+# -------- Option Chain --------
 st.markdown(f"### 3) Colar a option chain de **{sel}** (opcoes.net)")
 st.caption("No opcoes.net: copie a tabela completa (Ctrl/Cmd+C) e cole aqui (Ctrl/Cmd+V).")
 txt = st.text_area("Cole aqui a tabela (a primeira linha deve conter os cabeçalhos)", height=240)
@@ -329,7 +334,7 @@ if not df_raw.empty:
         calls = calls[calls["OTM"]].copy()
         puts  = puts[ puts["OTM"]].copy()
 
-        # mid = last (quando não houver bid/ask)
+        # mid = last (fallback)
         calls["mid"] = calls.get("last", np.nan)
         puts["mid"]  = puts.get("last", np.nan)
 
@@ -385,7 +390,7 @@ if not df_raw.empty:
             top3 = recs.sort_values("score", ascending=False).head(3).reset_index(drop=True)
 
             # ---------- TABELA TOP 3 ----------
-            st.markdown("### 🏆 Top 3 (melhor prêmio/risco) — Tabela")
+            st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
             tbl = top3.copy()
             tbl_disp = pd.DataFrame({
                 "Rank": [1,2,3][:len(tbl)],
@@ -426,9 +431,12 @@ if not df_raw.empty:
                     st.session_state["lot_map"][key_lotes] = lotes
 
                     premio_total = rw["credito"] * contract_size * lotes
-                    st.markdown(f"**🎯 Prêmio estimado (R$)** = crédito/ação × contrato × lotes = "
-                                f"**{rw['credito']:.2f} × {contract_size} × {lotes} = R$ {premio_total:,.2f}**"
-                                .replace(",", "X").replace(".", ",").replace("X","."))
+                    c1, c2 = st.columns([1, 2])
+                    c1.metric("🎯 Prêmio estimado (total)", format_brl(premio_total))
+                    c2.markdown(
+                        f"**Cálculo:** `crédito/ação × contrato × lotes` = "
+                        f"`{rw['credito']:.2f} × {contract_size} × {lotes}` → **{format_brl(premio_total)}**"
+                    )
 
                     with st.expander("📘 O que significa cada item?"):
                         st.markdown(
@@ -436,13 +444,8 @@ if not df_raw.empty:
                             "- **Break-evens:** intervalo em que o resultado no vencimento ainda é ≥ 0 "
                             f"([{rw['be_low']:.2f}, {rw['be_high']:.2f}]).  \n"
                             "- **PoE (Prob. expirar ITM):** estimativa por Black–Scholes (σ da cadeia, quando disponível).  \n"
-                            "- **Lotes:** número de strangles (PUT+CALL) vendidos. **Contrato** = {contract_size} ações."
-                        )
-                        st.markdown(
-                            f"**Regras práticas de saída**  \n"
-                            f"• ⏳ faltam ≤ **{dias_alerta}** dias  \n"
-                            f"• S encostando em **K_call** ⇒ recomprar a CALL  \n"
-                            f"• 🎯 capturar ~**{meta_captura}%** do crédito e encerrar"
+                            f"- **Lotes:** número de strangles (PUT+CALL) vendidos. **Contrato** = {contract_size} ações.  \n"
+                            f"- **Regras práticas de saída:** ⏳ faltam ≤ **{dias_alerta}** dias • S encostando em **K_call** ⇒ recomprar a CALL • 🎯 capturar ~**{meta_captura}%** do crédito."
                         )
 
             # ---------- RESUMO DE PRÊMIOS ----------
@@ -462,19 +465,5 @@ if not df_raw.empty:
                 })
             st.dataframe(pd.DataFrame(resumo), use_container_width=True)
 
-            # ---------- Comparação textual compacta ----------
-            st.markdown("### 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)")
-            base = top3.iloc[0]
-            Kp, Kc, cred = base["Kp"], base["Kc"], base["credito"]
-            wing_put = max(spot*0.92, Kp*0.97)
-            wing_call = min(spot*1.08, Kc*1.03)
-            st.markdown(
-                f"**Strangle (base):** vender PUT *Kp*={Kp:.2f} + CALL *Kc*={Kc:.2f} — crédito ≈ **R$ {cred:.2f}** por ação.  \n"
-                f"**Iron Condor:** comprar asas em ~({wing_put:.2f}, {wing_call:.2f}) para limitar perda.  \n"
-                f"**Jade Lizard:** PUT vendida + CALL vendida + CALL comprada (> {Kc:.2f}); se **crédito ≥ (Kc_w − Kc)**, sem risco na alta."
-            )
-
 else:
     st.info("Cole a tabela do **opcoes.net** para prosseguir.")
-
-st.caption("Dica: se a cotação do yfinance parecer defasada, recarregue (cache curto de 5 min).")
