@@ -24,12 +24,9 @@ def _br_to_float(x):
     s = str(x).strip()
     if s == "" or s == "-" or s.lower() in {"nan", "none"}:
         return np.nan
-    # remove espaços não quebráveis
     s = s.replace("\xa0", " ")
-    # mantém sinal +/-
     neg = s.startswith("-")
     s = s.replace("+", "").replace("-", "")
-    # remove pontos de milhar e troca vírgula por ponto
     s = s.replace(".", "").replace(",", ".")
     try:
         v = float(s)
@@ -38,9 +35,7 @@ def _br_to_float(x):
         return np.nan
 
 def _parse_date_br(s):
-    """
-    Recebe 'dd/mm/aaaa' ou 'dd/mm/aa' e retorna YYYY-MM-DD (str).
-    """
+    """Recebe 'dd/mm/aaaa' ou 'dd/mm/aa' e retorna YYYY-MM-DD (str)."""
     if pd.isna(s):
         return None
     s = str(s).strip()
@@ -105,9 +100,9 @@ def _clean_dataframe(df_raw):
         if col in df.columns:
             df[col] = df[col].map(_br_to_float)
 
-    # tipo -> "CALL"/"PUT" (aceita qualquer caixa)
+    # tipo -> "CALL"/"PUT"
     df["type"] = df["type"].astype(str).str.upper().str.replace("Ç","C").str.strip()
-    # 'CALL' / 'PUT' já vem do site; manter qualquer outra variação
+
     # expiration
     if "expiration" in df.columns:
         df["expiration"] = df["expiration"].astype(str).map(_parse_date_br)
@@ -127,7 +122,7 @@ def _clean_dataframe(df_raw):
     df = df[~df["type"].isna()]
     df = df[~df["expiration"].isna()]
 
-    # garante delta em módulo para filtro, mas mantém sinal para PoE-itm aproximado
+    # guarda |Δ|
     df["abs_delta"] = df["delta"].abs() if "delta" in df.columns else np.nan
 
     # ordena
@@ -181,23 +176,6 @@ def _pair_strangles(df_exp, spot, mindelta, maxdelta):
             }
             out.append(item)
     return out
-
-def _label_band(|delta_abs|, bands):
-    """
-    bands: dict com faixas em % ITM aproximado pelo |Δ| (0–1).
-    Retorna rótulo "Baixo/Médio/Alto" conforme limites.
-    """
-    if pd.isna(|delta_abs|):
-        return "—"
-    p = |delta_abs| * 100.0
-    low_hi  = bands["Baixo"][1]    # fim da faixa baixa
-    mid_hi  = bands["Médio"][1]    # fim da faixa média
-    if p <= low_hi:
-        return "Baixo"
-    elif p <= mid_hi:
-        return "Médio"
-    else:
-        return "Alto"
 
 def _format_money(v):
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
@@ -331,21 +309,18 @@ if df is not None and not df.empty:
         dfc["Banda_call"] = dfc["Δ_call"].map(band_label)
 
         # cobertura: CALL coberta por ações, PUT por caixa
-        # lotes máximos
         max_lotes_call = qty_shares // contract_size if contract_size>0 else 0
-        # risco put: alocação nominal ≈ K_put * contrato
         dfc["Aloc. PUT (R$) por lote"] = dfc["K_put"] * contract_size
         dfc["Lotes PUT cash-secured"]   = np.floor(cash_avail / dfc["Aloc. PUT (R$) por lote"]).astype(int)
         dfc["Lotes CALL cobertos"]      = max_lotes_call
         dfc["Lotes máx. cobertos"]      = dfc[["Lotes PUT cash-secured","Lotes CALL cobertos"]].min(axis=1)
 
-        # rank simples: maior crédito / (distância relativa das asas até S)
+        # rank: maior crédito / distância relativa das asas até S
         dist_rel = ((dfc["K_call"] - spot).abs() + (spot - dfc["K_put"]).abs())/max(spot,1e-6)
         dfc["score"] = dfc["Crédito num"] / (dist_rel.replace(0, np.nan))
         dfc = dfc.sort_values(["Lotes máx. cobertos","score","Crédito num"], ascending=[False, False, False])
 
-        # dica de saída (usa proximidade e DTE)
-        # dias até venc = diferença real
+        # dica de saída
         try:
             d_exp = date.fromisoformat(chosen_exp)
             dte = (d_exp - date.today()).days
@@ -373,10 +348,9 @@ if df is not None and not df.empty:
         # TOP 3
         top3 = dfc[dfc["Lotes máx. cobertos"]>0].head(3).copy()
         if top3.empty:
-            top3 = dfc.head(3).copy()  # se não houver cobertura, mostra mesmo assim
+            top3 = dfc.head(3).copy()
 
         st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
-        # Imprime no estilo “anterior”, com linhas simples e fortes, sem cards
         for i, rw in top3.reset_index(drop=True).iterrows():
             credito_lote = rw["Crédito num"] * contract_size
             st.markdown(
@@ -401,7 +375,6 @@ if df is not None and not df.empty:
 
         # ========== Comparar estratégias (resumo didático) ==========
         st.markdown("### 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)")
-        # base = melhor do top3
         base = top3.iloc[0] if not top3.empty else dfc.iloc[0]
         Kp, Kc = base["K_put"], base["K_call"]
         credito = base["Crédito num"]
@@ -442,4 +415,3 @@ if df is not None and not df.empty:
         )
 else:
     st.info("Cole a **tabela completa** do opcoes.net acima para começar. Dica: clique na tabela no site, **CTRL/CMD+C** e depois **CTRL/CMD+V** aqui.")
-
