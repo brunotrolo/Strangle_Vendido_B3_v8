@@ -471,30 +471,32 @@ for i, rw in top3.iterrows():
             f"`{rw['credito']:.2f} × {CONTRACT_SIZE} × {lots}` → **{format_brl(premio_total)}**"
         )
 
-        with st.expander("📘 O que significa cada item?"):
-            st.markdown(
-                f"""
+    with st.expander("📘 O que significa cada item?"):
+    st.markdown(
+        f"""
 **Crédito/ação**  
 Soma dos prêmios recebidos ao vender **1 PUT** e **1 CALL** (por **ação**).  
-*Exemplo:* se PUT paga R$ 0,08 e CALL paga R$ 0,06, o total é **R$ 0,14 por ação**.
+*Exemplo deste cenário:* a **PUT** paga **R$ {rw['premio_put']:.2f}** e a **CALL** paga **R$ {rw['premio_call']:.2f}**, somando **R$ {rw['credito']:.2f}** por ação.  
 
 **Break-evens (mín–máx)**  
 Faixa de preço no vencimento onde o resultado ainda é ≥ 0.  
-*Exemplo desta sugestão:* **{rw['be_low']:.2f} — {rw['be_high']:.2f}**.
+*Exemplo:* se o ativo oscilar entre **R$ {rw['be_low']:.2f} e R$ {rw['be_high']:.2f}**, você encerra a operação no zero a zero ou com lucro.  
 
 **Probabilidade de exercício (PUT / CALL)**  
-Chance estimada (Black–Scholes) de a opção terminar **dentro do dinheiro** no vencimento.  
-*Exemplo:* **PUT {100*rw['poe_put']:.1f}%** significa {100*rw['poe_put']:.1f}% de chance de S < Strike da PUT.
+Estimativa (modelo Black–Scholes) da chance de cada opção ser exercida no vencimento.  
+*Exemplo:* **PUT {100*rw['poe_put']:.1f}%** → {100*rw['poe_put']:.1f}% de chance de o preço cair abaixo do strike **R$ {rw['Kp']:.2f}**.  
+**CALL {100*rw['poe_call']:.1f}%** → {100*rw['poe_call']:.1f}% de chance de subir acima de **R$ {rw['Kc']:.2f}**.  
 
 **Lotes e prêmio total**  
 Cada **lote** = vender **1 PUT + 1 CALL** (contrato = {CONTRACT_SIZE} ações).  
-Prêmio total = **crédito/ação × contrato × lotes**.
+Prêmio total = **crédito/ação × contrato × lotes**.  
+*Exemplo:* R$ {rw['credito']:.2f} × {CONTRACT_SIZE} × {lots} = **{format_brl(premio_total)}**.  
 
 **Regras práticas de saída**  
-⏳ faltam ≤ **{dias_alerta}** dias: acompanhe com mais atenção.  
-📈 se **S** encostar no **Strike da CALL**, recompre a CALL.  
-🎯 tente capturar **~{meta_captura}%** do crédito e encerrar.
-"""
+⏳ faltam ≤ **{dias_alerta}** dias → acompanhe com mais atenção.  
+📈 se **S** encostar no **Strike da CALL ({rw['Kc']:.2f})**, recompre a CALL.  
+🎯 tente capturar
+
             )
 
 # Rodapé leve
