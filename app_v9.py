@@ -4,21 +4,20 @@
 # - Busca dinâmica de tickers na B3 (dadosdemercado.com.br/acoes)
 # - Cotação automática via yfinance (sempre)
 # - Input para colar option chain do opcoes.net
-# - Sugerir TOP3 strangles + comparação (Strangle x Iron Condor x Jade Lizard)
-# - Parser robusto: dedup de colunas e escolha da 1ª ocorrência
+# - TOP3 em tabela + blocos explicativos c/ lotes e prêmio estimado
+# - Parser robusto (dedup de colunas e primeira ocorrência)
 # --------------------------------------------
 
 import re
 import io
 import math
-import time
 import json
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from datetime import datetime, date
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional
 
 # yfinance para cotação
 try:
@@ -42,7 +41,11 @@ def _parse_percent_to_vol(x):
     if pd.isna(x):
         return np.nan
     s = str(x).strip().replace("%","").replace(" ", "")
-    s = s.replace(".", "").replace(",", ".") if s.count(",") == 1 and s.count(".")>1 else s.replace(",", ".")
+    # tratamento pt-BR vs en-US
+    if s.count(",") == 1 and s.count(".") > 1:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
     v = _safe_float(s)
     return v/100.0 if pd.notna(v) else np.nan
 
@@ -177,10 +180,6 @@ def _dedup_cols(cols):
     return out
 
 def _pick_first(df: pd.DataFrame, base: str) -> Optional[str]:
-    """
-    Retorna o nome da 1ª coluna que seja exatamente `base`
-    ou que comece com `base.` (após dedup).
-    """
     if base in df.columns:
         return base
     pref = [c for c in df.columns if c == base or c.startswith(base + ".")]
@@ -202,12 +201,9 @@ def parse_pasted_table(txt: str) -> pd.DataFrame:
         norm = [row + [""]*(width-len(row)) for row in lines]
         df = pd.DataFrame(norm[1:], columns=norm[0])
 
-    # normaliza headers
     df.columns = [_normalize_header(c) for c in df.columns]
-    # deduplica headers (CRÍTICO p/ evitar DataFrame em df["strike"])
     df.columns = _dedup_cols(df.columns)
 
-    # escolher apenas a 1ª ocorrência de cada coluna-alvo
     targets = ["symbol","type","strike","last","impliedVol","delta","expiration"]
     col_sel = {}
     for t in targets:
@@ -221,7 +217,6 @@ def parse_pasted_table(txt: str) -> pd.DataFrame:
     df = df[list(col_sel.values())].copy()
     df = df.rename(columns={v:k for k,v in col_sel.items()})
 
-    # normalizações de valores
     if "type" in df.columns:
         df["type"] = df["type"].astype(str).str.upper().str.strip()
         df["type"] = df["type"].replace({"CALL":"C","PUT":"P","C":"C","P":"P","E":"P","A":"C"})
@@ -274,6 +269,9 @@ with st.sidebar:
                                 help="Filtro por moneyness via Delta. ~0,05–0,35 é comum.")
     delta_max = st.number_input("|Δ| máximo", min_value=0.0, max_value=1.0, value=0.35, step=0.01,
                                 help="Maior |Δ| aceito para as opções vendidas.")
+    contract_size = st.number_input("Tamanho do contrato (ações/contrato)", min_value=1, max_value=10000, value=100, step=1)
+
+    st.markdown("---")
     st.markdown("### 🚪 Instruções de SAÍDA")
     dias_alerta = st.number_input("Dias até vencimento (alerta)", min_value=0, max_value=60, value=7, step=1)
     prox_pct = st.number_input("Proximidade ao strike (%)", min_value=0.0, max_value=20.0, value=1.0, step=0.5)
@@ -313,10 +311,11 @@ if not df_raw.empty:
         calls = df_exp[df_exp["type"]=="C"].copy()
         puts  = df_exp[df_exp["type"]=="P"].copy()
 
-        # --- FIX: garantir que 'strike' é Series única (parser já faz), então segue normal:
+        # OTM
         calls["OTM"] = calls["strike"] > float(spot)
         puts["OTM"]  = puts["strike"]  < float(spot)
 
+        # filtros por |delta|
         def _absd_ok(d):
             if pd.isna(d): 
                 return True
@@ -330,18 +329,20 @@ if not df_raw.empty:
         calls = calls[calls["OTM"]].copy()
         puts  = puts[ puts["OTM"]].copy()
 
+        # mid = last (quando não houver bid/ask)
         calls["mid"] = calls.get("last", np.nan)
         puts["mid"]  = puts.get("last", np.nan)
 
         default_sigma = 0.20
-        if "impliedVol" in df_exp.columns and df_exp["impliedVol"].notna().any():
-            sigma_call = calls["impliedVol"].fillna(default_sigma) if "impliedVol" in calls.columns else pd.Series(default_sigma, index=calls.index)
-            sigma_put  = puts["impliedVol"].fillna(default_sigma)  if "impliedVol"  in puts.columns  else pd.Series(default_sigma, index=puts.index)
-        else:
-            sigma_call = pd.Series(default_sigma, index=calls.index)
-            sigma_put  = pd.Series(default_sigma, index=puts.index)
-
         T = yearfrac(date.today(), exp_sel)
+
+        def _sigma_series(df_leg):
+            if "impliedVol" in df_leg.columns and df_leg["impliedVol"].notna().any():
+                return df_leg["impliedVol"].fillna(default_sigma)
+            return pd.Series(default_sigma, index=df_leg.index)
+
+        sigma_call = _sigma_series(calls)
+        sigma_put  = _sigma_series(puts)
 
         calls["prob_ITM"] = [prob_ITM_call(spot, K, r, s, T) for K, s in zip(calls["strike"], sigma_call)]
         puts["prob_ITM"]  = [prob_ITM_put (spot, K, r, s, T) for K, s in zip(puts["strike"],  sigma_put )]
@@ -352,9 +353,11 @@ if not df_raw.empty:
         pairs = []
         for _, p in puts_rank.iterrows():
             for _, c in calls_rank.iterrows():
-                credito = (p.get("mid", 0.0) or 0.0) + (c.get("mid", 0.0) or 0.0)
-                if pd.isna(credito):
+                pmid = (p.get("mid", 0.0) or 0.0)
+                cmid = (c.get("mid", 0.0) or 0.0)
+                if pd.isna(pmid) or pd.isna(cmid):
                     continue
+                credito = float(pmid) + float(cmid)
                 k_put, k_call = float(p["strike"]), float(c["strike"])
                 be_low  = k_put - credito
                 be_high = k_call + credito
@@ -363,12 +366,15 @@ if not df_raw.empty:
                 poe_sum = (poe_p if pd.notna(poe_p) else 0.15) + (poe_c if pd.notna(poe_c) else 0.15)
                 score = (credito + 1e-6) / (poe_sum + 1e-6)
                 pairs.append({
-                    "put_symbol": p.get("symbol",""),
-                    "call_symbol": c.get("symbol",""),
-                    "Kp": k_put, "Kc": k_call,
+                    "PUT": p.get("symbol",""),
+                    "Kp": k_put,
+                    "CALL": c.get("symbol",""),
+                    "Kc": k_call,
                     "credito": float(credito),
-                    "be_low": be_low, "be_high": be_high,
-                    "poe_put": poe_p, "poe_call": poe_c,
+                    "be_low": be_low, 
+                    "be_high": be_high,
+                    "poe_put": poe_p, 
+                    "poe_call": poe_c,
                     "score": score,
                 })
 
@@ -378,38 +384,96 @@ if not df_raw.empty:
         else:
             top3 = recs.sort_values("score", ascending=False).head(3).reset_index(drop=True)
 
-            st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
+            # ---------- TABELA TOP 3 ----------
+            st.markdown("### 🏆 Top 3 (melhor prêmio/risco) — Tabela")
+            tbl = top3.copy()
+            tbl_disp = pd.DataFrame({
+                "Rank": [1,2,3][:len(tbl)],
+                "PUT": tbl["PUT"],
+                "Kp": tbl["Kp"].round(2),
+                "CALL": tbl["CALL"],
+                "Kc": tbl["Kc"].round(2),
+                "Crédito/ação (R$)": tbl["credito"].round(2),
+                "Break-evens": tbl.apply(lambda r: f"[{r['be_low']:.2f}, {r['be_high']:.2f}]", axis=1),
+                "PoE PUT (%)": (100*tbl["poe_put"]).round(1),
+                "PoE CALL (%)": (100*tbl["poe_call"]).round(1),
+            })
+            st.dataframe(tbl_disp, use_container_width=True)
+
+            # ---------- BLOCO POR RECOMENDAÇÃO + LOTES ----------
+            st.markdown("### 📋 Sugestões detalhadas (com lotes e prêmio total)")
+
+            if "lot_map" not in st.session_state:
+                st.session_state["lot_map"] = {}
+
             for i, rw in top3.iterrows():
-                dica = f"⏳ ≤ {dias_alerta} dias | S encostando em K_call ⇒ recomprar CALL | 🎯 capturar ~{meta_captura}% do crédito"
-                st.markdown(
-                    f"**#{i+1}** → Vender **PUT {rw['put_symbol']} (K={rw['Kp']:.2f})** + "
-                    f"**CALL {rw['call_symbol']} (K={rw['Kc']:.2f})**  \n"
-                    f"• **Crédito/ação:** R$ {rw['credito']:.2f}  | "
-                    f"**Break-evens:** [{rw['be_low']:.2f}, {rw['be_high']:.2f}]  \n"
-                    f"• **PoE PUT:** {100*(rw['poe_put'] if pd.notna(rw['poe_put']) else np.nan):.1f}%  • "
-                    f"**PoE CALL:** {100*(rw['poe_call'] if pd.notna(rw['poe_call']) else np.nan):.1f}%  \n"
-                    f"• {dica}"
-                )
+                rank = i + 1
+                key_lotes = f"lotes_rank_{rank}"
+                if key_lotes not in st.session_state["lot_map"]:
+                    st.session_state["lot_map"][key_lotes] = 1
 
+                with st.container(border=True):
+                    st.markdown(
+                        f"**#{rank}** → Vender **PUT {rw['PUT']} (K={rw['Kp']:.2f})** + "
+                        f"**CALL {rw['CALL']} (K={rw['Kc']:.2f})**"
+                    )
+                    col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
+                    col1.metric("Crédito/ação (R$)", f"{rw['credito']:.2f}")
+                    col2.metric("Break-evens", f"[{rw['be_low']:.2f}, {rw['be_high']:.2f}]")
+                    col3.metric("PoE PUT / CALL (%)", f"{100*rw['poe_put']:.1f} / {100*rw['poe_call']:.1f}")
+                    lotes = col4.number_input("Lotes", min_value=0, max_value=10000,
+                                              value=st.session_state['lot_map'][key_lotes], step=1, key=key_lotes)
+                    st.session_state["lot_map"][key_lotes] = lotes
+
+                    premio_total = rw["credito"] * contract_size * lotes
+                    st.markdown(f"**🎯 Prêmio estimado (R$)** = crédito/ação × contrato × lotes = "
+                                f"**{rw['credito']:.2f} × {contract_size} × {lotes} = R$ {premio_total:,.2f}**"
+                                .replace(",", "X").replace(".", ",").replace("X","."))
+
+                    with st.expander("📘 O que significa cada item?"):
+                        st.markdown(
+                            "- **Crédito/ação:** soma dos prêmios recebidos ao **vender** a PUT e a CALL (por ação).  \n"
+                            "- **Break-evens:** intervalo em que o resultado no vencimento ainda é ≥ 0 "
+                            f"([{rw['be_low']:.2f}, {rw['be_high']:.2f}]).  \n"
+                            "- **PoE (Prob. expirar ITM):** estimativa por Black–Scholes (σ da cadeia, quando disponível).  \n"
+                            "- **Lotes:** número de strangles (PUT+CALL) vendidos. **Contrato** = {contract_size} ações."
+                        )
+                        st.markdown(
+                            f"**Regras práticas de saída**  \n"
+                            f"• ⏳ faltam ≤ **{dias_alerta}** dias  \n"
+                            f"• S encostando em **K_call** ⇒ recomprar a CALL  \n"
+                            f"• 🎯 capturar ~**{meta_captura}%** do crédito e encerrar"
+                        )
+
+            # ---------- RESUMO DE PRÊMIOS ----------
+            st.markdown("### 💰 Resumo dos prêmios (com os lotes escolhidos)")
+            resumo = []
+            for i, rw in top3.iterrows():
+                rank = i+1
+                lotes = st.session_state["lot_map"].get(f"lotes_rank_{rank}", 0)
+                premio_total = rw["credito"] * contract_size * lotes
+                resumo.append({
+                    "Rank": rank,
+                    "PUT": rw["PUT"], "Kp": round(rw["Kp"],2),
+                    "CALL": rw["CALL"], "Kc": round(rw["Kc"],2),
+                    "Lotes": lotes,
+                    "Crédito/ação (R$)": round(rw["credito"],2),
+                    "Prêmio total (R$)": round(premio_total, 2),
+                })
+            st.dataframe(pd.DataFrame(resumo), use_container_width=True)
+
+            # ---------- Comparação textual compacta ----------
             st.markdown("### 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)")
-            if not top3.empty:
-                base = top3.iloc[0]
-                Kp, Kc, cred = base["Kp"], base["Kc"], base["credito"]
-                wing_put = max(spot*0.92, Kp*0.97)
-                wing_call = min(spot*1.08, Kc*1.03)
-                st.markdown(
-                    f"**Strangle (base):** vender PUT *Kp*={Kp:.2f} + CALL *Kc*={Kc:.2f} — crédito ≈ **R$ {cred:.2f}**.  \n"
-                    f"**Iron Condor:** comprar asas em ~({wing_put:.2f}, {wing_call:.2f}) para limitar perda.  \n"
-                    f"**Jade Lizard:** PUT vendida + CALL vendida + CALL comprada (> {Kc:.2f}); se **crédito ≥ (Kc_w − Kc)**, sem risco na alta."
-                )
+            base = top3.iloc[0]
+            Kp, Kc, cred = base["Kp"], base["Kc"], base["credito"]
+            wing_put = max(spot*0.92, Kp*0.97)
+            wing_call = min(spot*1.08, Kc*1.03)
+            st.markdown(
+                f"**Strangle (base):** vender PUT *Kp*={Kp:.2f} + CALL *Kc*={Kc:.2f} — crédito ≈ **R$ {cred:.2f}** por ação.  \n"
+                f"**Iron Condor:** comprar asas em ~({wing_put:.2f}, {wing_call:.2f}) para limitar perda.  \n"
+                f"**Jade Lizard:** PUT vendida + CALL vendida + CALL comprada (> {Kc:.2f}); se **crédito ≥ (Kc_w − Kc)**, sem risco na alta."
+            )
 
-            with st.expander("📘 Explicações e fórmulas"):
-                st.markdown(
-                    "- **Strangle:** vender PUT OTM e CALL OTM. Lucro máx = crédito.  \n"
-                    "  Π(S) = −max(0, Kp−S) − max(0, S−Kc) + crédito  \n"
-                    "- **Iron Condor:** Strangle + compra das asas → perda máx limitada.  \n"
-                    "- **Jade Lizard:** PUT vendida + CALL vendida + CALL comprada; se crédito ≥ diferença das CALLs, **sem risco na alta**."
-                )
 else:
     st.info("Cole a tabela do **opcoes.net** para prosseguir.")
 
