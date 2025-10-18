@@ -442,3 +442,4 @@ if df is not None and not df.empty:
         )
 else:
     st.info("Cole a **tabela completa** do opcoes.net acima para começar. Dica: clique na tabela no site, **CTRL/CMD+C** e depois **CTRL/CMD+V** aqui.")
+
