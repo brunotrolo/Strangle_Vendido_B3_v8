@@ -1,549 +1,444 @@
 # app_v9.py
-# ============================================
 # Strangle Vendido Coberto — v9 (colar tabela do opcoes.net)
-# - Pegar opção colada (tabela opcoes.net)
-# - Escolher vencimento
-# - Sugerir Strangles (Top 3) com detalhes didáticos
-# - Aba "Comparar estratégias" (Strangle × Iron Condor × Jade Lizard)
-# - Tooltips explicativos nos parâmetros (ajuda ao passar o mouse)
-# ============================================
-
-import io
-import math
-import numpy as np
-import pandas as pd
+# Requisitos: streamlit, pandas, numpy, python-dateutil
 import streamlit as st
-import matplotlib.pyplot as plt
-from datetime import datetime
+import pandas as pd
+import numpy as np
+import re
+from io import StringIO
+from datetime import datetime, date
+from dateutil.parser import parse as dtparse
 
-# ------------------------
-# Utilidades numéricas
-# ------------------------
-SQRT_2 = math.sqrt(2.0)
+st.set_page_config(page_title="Strangle Vendido Coberto — v9", layout="wide")
 
-def norm_cdf(x: float) -> float:
-    if x is None or isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-        return float('nan')
-    return 0.5 * (1.0 + math.erf(x / SQRT_2))
-
-def d1_d2(S, K, r, sigma, T):
-    try:
-        if S <= 0 or K <= 0 or sigma <= 0 or T <= 0:
-            return float('nan'), float('nan')
-        num = math.log(S / K) + (r + 0.5 * sigma * sigma) * T
-        den = sigma * math.sqrt(T)
-        d1 = num / den
-        d2 = d1 - den
-        return d1, d2
-    except Exception:
-        return float('nan'), float('nan')
-
-def prob_ITM_call(S, K, r, sigma, T):
-    # P(S_T > K) ≈ N(d2) no world risk-neutral
-    _, d2 = d1_d2(S, K, r, sigma, T)
-    return norm_cdf(d2) if not math.isnan(d2) else float('nan')
-
-def prob_ITM_put(S, K, r, sigma, T):
-    # P(S_T < K) = 1 - P(S_T > K) ≈ 1 - N(d2)
-    _, d2 = d1_d2(S, K, r, sigma, T)
-    return 1.0 - norm_cdf(d2) if not math.isnan(d2) else float('nan')
-
-# ------------------------
-# Conversões e parsing
-# ------------------------
-def brazil_to_float(x):
+# ============== UTIL ==============
+def _br_to_float(x):
     """
-    Converte string no formato brasileiro para float.
-    Exemplos:
-      "1.234,56" -> 1234.56
-      "0,42"     -> 0.42
-      "—", "", None -> NaN
+    Converte strings PT-BR (1.234.567,89) -> float(1234567.89).
+    Devolve np.nan para vazios/traços.
     """
-    if pd.isna(x):
+    if x is None:
         return np.nan
-    if isinstance(x, (int, float)):
+    if isinstance(x, (int, float, np.floating)):
         return float(x)
     s = str(x).strip()
-    if s == "" or s == "—" or s == "-":
+    if s == "" or s == "-" or s.lower() in {"nan", "none"}:
         return np.nan
-    # Remove espaços, substitui milhares ".", decimal ","
-    s = s.replace(" ", "").replace(".", "").replace(",", ".")
+    # remove espaços não quebráveis
+    s = s.replace("\xa0", " ")
+    # mantém sinal +/-
+    neg = s.startswith("-")
+    s = s.replace("+", "").replace("-", "")
+    # remove pontos de milhar e troca vírgula por ponto
+    s = s.replace(".", "").replace(",", ".")
     try:
-        return float(s)
-    except Exception:
+        v = float(s)
+        return -v if neg else v
+    except:
         return np.nan
 
-def parse_date_ptbr(x):
-    """Converte 'dd/mm/aaaa' para 'YYYY-MM-DD'."""
-    if pd.isna(x):
-        return np.nan
-    s = str(x).strip()
-    # Já em ISO?
-    try:
-        # tenta aaaa-mm-dd
-        dt = pd.to_datetime(s, errors="raise", dayfirst=False)
-        return dt.date().isoformat()
-    except Exception:
-        pass
-    # tenta dd/mm/aaaa
-    try:
-        dt = pd.to_datetime(s, format="%d/%m/%Y", errors="raise", dayfirst=True)
-        return dt.date().isoformat()
-    except Exception:
-        # últimas tentativas genéricas
-        try:
-            dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-            return dt.date().isoformat() if pd.notna(dt) else np.nan
-        except Exception:
-            return np.nan
-
-def padronizar_colunas(df_raw: pd.DataFrame) -> pd.DataFrame:
+def _parse_date_br(s):
     """
-    Mapeia cabeçalhos do opcoes.net (PT-BR) para colunas padronizadas:
-      symbol, type, strike, last, mid, impliedVol, delta, expiration
+    Recebe 'dd/mm/aaaa' ou 'dd/mm/aa' e retorna YYYY-MM-DD (str).
     """
-    rename_map = {}
-    cols = {c.strip(): c for c in df_raw.columns}
+    if pd.isna(s):
+        return None
+    s = str(s).strip()
+    try:
+        d = dtparse(s, dayfirst=True).date()
+        return d.isoformat()
+    except:
+        return None
 
-    def has(name):
-        return name in cols
+def _guess_sep_from_text(text):
+    # opcoes.net costuma copiar com TAB. Se não, fallback “>=2 espaços”.
+    if "\t" in text:
+        return "\t"
+    return r"\s{2,}"
 
-    # Mapeamentos típicos do opcoes.net:
-    if has("Ticker"):            rename_map[cols["Ticker"]] = "symbol"
-    if has("Tipo"):              rename_map[cols["Tipo"]] = "type"
-    if has("Strike"):            rename_map[cols["Strike"]] = "strike"
-    if has("Último"):            rename_map[cols["Último"]] = "last"
-    if has("Vol. Impl. (%)"):    rename_map[cols["Vol. Impl. (%)"]] = "impliedVol"
-    if has("Delta"):             rename_map[cols["Delta"]] = "delta"
-    if has("Vencimento"):        rename_map[cols["Vencimento"]] = "expiration"
+def _normalize_header(cols):
+    """
+    Normaliza headers típicos do opcoes.net em PT-BR -> chaves padrão.
+    """
+    mapping = {
+        "ticker": "symbol",
+        "símbolo": "symbol",
+        "vencimento": "expiration",
+        "dias úteis": "bdays",
+        "tipo": "type",
+        "strike": "strike",
+        "último": "last",
+        "ult.": "last",
+        "bid": "bid",
+        "ask": "ask",
+        "vol. impl. (%)": "impliedVol",
+        "vol. impl.": "impliedVol",
+        "delta": "delta",
+        "gamma": "gamma",
+        "vega": "vega",
+        "theta ($)": "theta",
+        "theta (%)": "theta_pct",
+        "a/i/otm": "moneyness",
+        "dist. (%) do strike": "dist_strike",
+        "f.m.": "fm",
+        "mod.": "mod",
+    }
+    out = []
+    for c in cols:
+        key = str(c).strip().lower()
+        key = re.sub(r"\s+", " ", key)
+        out.append(mapping.get(key, c))
+    return out
 
-    df = df_raw.rename(columns=rename_map).copy()
+def _clean_dataframe(df_raw):
+    # renomeia colunas
+    df = df_raw.copy()
+    df.columns = _normalize_header(df.columns)
 
-    # Normaliza 'type' -> 'C'/'P'
-    if "type" in df.columns:
-        df["type"] = df["type"].astype(str).str.upper().str.strip()
-        df["type"] = df["type"].replace({"CALL": "C", "PUT": "P"})
+    # padroniza colunas essenciais, criando se não vierem
+    for col in ["symbol","type","strike","last","impliedVol","delta","expiration"]:
+        if col not in df.columns:
+            df[col] = np.nan
 
-    # Numeric conversions
-    if "strike" in df.columns:
-        df["strike"] = df["strike"].apply(brazil_to_float)
-    if "last" in df.columns:
-        df["last"] = df["last"].apply(brazil_to_float)
-    # mid não existe no site — manter como NaN e usar last como fallback
-    df["mid"] = np.nan
-    # impliedVol: percentual -> decimal
-    if "impliedVol" in df.columns:
-        df["impliedVol"] = df["impliedVol"].apply(brazil_to_float) / 100.0
-    # delta (pode vir com virgula)
-    if "delta" in df.columns:
-        df["delta"] = df["delta"].apply(brazil_to_float)
+    # normaliza números PT-BR nas colunas principais
+    for col in ["strike","last","impliedVol","delta","bid","ask"]:
+        if col in df.columns:
+            df[col] = df[col].map(_br_to_float)
 
-    # expiration -> ISO
+    # tipo -> "CALL"/"PUT" (aceita qualquer caixa)
+    df["type"] = df["type"].astype(str).str.upper().str.replace("Ç","C").str.strip()
+    # 'CALL' / 'PUT' já vem do site; manter qualquer outra variação
+    # expiration
     if "expiration" in df.columns:
-        df["expiration"] = df["expiration"].apply(parse_date_ptbr)
+        df["expiration"] = df["expiration"].astype(str).map(_parse_date_br)
 
-    # Tira linhas totalmente vazias
-    df = df.dropna(how="all")
+    # símbolo
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].astype(str).str.strip()
+
+    # Se não houver 'last', tenta mid=(bid+ask)/2
+    if "last" in df.columns:
+        if df["last"].isna().all():
+            if "bid" in df.columns and "ask" in df.columns:
+                df["last"] = (df["bid"] + df["ask"]) / 2.0
+
+    # remove linhas sem strike ou sem tipo/venc
+    df = df[~df["strike"].isna()]
+    df = df[~df["type"].isna()]
+    df = df[~df["expiration"].isna()]
+
+    # garante delta em módulo para filtro, mas mantém sinal para PoE-itm aproximado
+    df["abs_delta"] = df["delta"].abs() if "delta" in df.columns else np.nan
+
+    # ordena
+    df = df.sort_values(["expiration","type","strike"], ascending=[True, True, True])
+    df = df.reset_index(drop=True)
     return df
 
-def parse_pasted_table(text: str) -> pd.DataFrame:
+def _pair_strangles(df_exp, spot, mindelta, maxdelta):
     """
-    Lê a tabela colada (normalmente tabs) em DataFrame e padroniza colunas.
+    Recebe DF de UM vencimento, separa CALL OTM (K > S) e PUT OTM (K < S),
+    aplica filtro de |Δ| e cruza todas as combinações.
+    Retorna lista de dicts com métricas.
     """
-    # Muitas vezes o opcoes.net usa \t; usaremos regex para tabs e múltiplos espaços
-    try:
-        data = pd.read_csv(io.StringIO(text), sep=r"\t+|\s{2,}", engine="python")
-    except Exception:
-        # fallback: qualquer separador de espaços
-        data = pd.read_csv(io.StringIO(text), sep=r"\s+", engine="python")
+    # filtros OTM
+    calls = df_exp[(df_exp["type"].str.contains("CALL")) & (df_exp["strike"] > spot)].copy()
+    puts  = df_exp[(df_exp["type"].str.contains("PUT"))  & (df_exp["strike"] < spot)].copy()
 
-    # Remove colunas "em branco" criadas por separador
-    data = data.loc[:, ~data.columns.astype(str).str.contains("^Unnamed")]
-    return padronizar_colunas(data)
+    # filtro por |Δ|
+    if not np.isnan(mindelta):
+        calls = calls[calls["abs_delta"] >= mindelta]
+        puts  = puts[puts["abs_delta"]  >= mindelta]
+    if not np.isnan(maxdelta):
+        calls = calls[calls["abs_delta"] <= maxdelta]
+        puts  = puts[puts["abs_delta"]  <= maxdelta]
 
-# ------------------------
-# Cobertura e score
-# ------------------------
-def band_from_prob(prob_ex):
-    if pd.isna(prob_ex):
-        return "—"
-    x = 100.0 * float(prob_ex)
-    if x <= 15: return "Baixa"
-    if x <= 35: return "Média"
-    return "Alta"
+    out = []
+    if calls.empty or puts.empty:
+        return out
 
-def safe_mid(row):
-    val = row.get('mid', np.nan)
-    if pd.isna(val) or not isinstance(val, (int, float)):
-        val = row.get('last', np.nan)
-    try:
-        return float(val) if pd.notna(val) else 0.0
-    except Exception:
-        return 0.0
-
-def fmt_money(x): 
-    try:
-        return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-    except Exception:
-        return "R$ 0,00"
-
-def fmt_pct(x):
-    return "—" if pd.isna(x) else f"{float(x)*100:.1f}%"
-
-def covered_lots_limits(Kp, contract_size, shares_owned, cash_available):
-    max_lots_call = max(0, int(shares_owned // contract_size))  # CALL coberta por ações
-    max_lots_put  = max(0, int((cash_available // 1) // (Kp * contract_size)))  # PUT coberta por caixa no strike
-    return max_lots_call, max_lots_put
-
-def select_top3(puts, calls, spot, r, sigma, T, contract_size, shares_owned, cash_available, topn=3):
-    if puts.empty or calls.empty:
-        return pd.DataFrame()
-
-    p_df = puts.copy()
-    c_df = calls.copy()
-    p_df["prem_put"]  = p_df.apply(safe_mid, axis=1)
-    c_df["prem_call"] = c_df.apply(safe_mid, axis=1)
-
-    combos = []
-    for _, prow in p_df.iterrows():
-        for _, crow in c_df.iterrows():
-            try:
-                Kp = float(prow["strike"]); Kc = float(crow["strike"])
-            except Exception:
+    for _, rc in calls.iterrows():
+        for _, rp in puts.iterrows():
+            prem_call = rc["last"] if pd.notna(rc["last"]) else 0.0
+            prem_put  = rp["last"] if pd.notna(rp["last"]) else 0.0
+            credito   = (prem_call or 0.0) + (prem_put or 0.0)
+            if credito <= 0 or pd.isna(credito):
                 continue
-            prem_p = float(prow["prem_put"]); prem_c = float(crow["prem_call"])
-            credito = prem_p + prem_c
-
-            p_ex_call = prob_ITM_call(spot, Kc, r, sigma, T)
-            p_ex_put  = prob_ITM_put(spot, Kp, r, sigma, T)
-
-            banda_c = band_from_prob(p_ex_call)
-            banda_p = band_from_prob(p_ex_put)
-
+            Kc = rc["strike"]; Kp = rp["strike"]
             be_low  = Kp - credito
             be_high = Kc + credito
+            item = {
+                "PUT": rp["symbol"], "CALL": rc["symbol"],
+                "K_put": Kp, "K_call": Kc,
+                "Prêmio PUT": prem_put, "Prêmio CALL": prem_call,
+                "Crédito (R$)": f"R$ {credito:,.2f}".replace(",", "X").replace(".", ",").replace("X","."),
+                "Crédito num": credito,
+                "BE_inferior": be_low, "BE_superior": be_high,
+                "Δ_put": rp["abs_delta"], "Δ_call": rc["abs_delta"],
+                "PoE_put": f"{(abs(rp['delta']*100) if pd.notna(rp['delta']) else np.nan):.1f}%",
+                "PoE_call": f"{(abs(rc['delta']*100) if pd.notna(rc['delta']) else np.nan):.1f}%",
+                "expiration": rp["expiration"],
+            }
+            out.append(item)
+    return out
 
-            max_call, max_put = covered_lots_limits(Kp, contract_size, shares_owned, cash_available)
-            max_lots = min(max_call, max_put)
-
-            score = credito * (1.0 - 0.5 * ((p_ex_call if not pd.isna(p_ex_call) else 0) + (p_ex_put if not pd.isna(p_ex_put) else 0)))
-
-            combos.append({
-                "Vencimento": prow.get("expiration", crow.get("expiration","")),
-                "PUT": prow.get("symbol",""),
-                "K_put": Kp,
-                "Prêmio PUT": prem_p,
-                "Δ_put": abs(float(prow.get("delta", np.nan))) if "delta" in prow else np.nan,
-                "PoE_put": p_ex_put,
-                "Banda_put": banda_p,
-
-                "CALL": crow.get("symbol",""),
-                "K_call": Kc,
-                "Prêmio CALL": prem_c,
-                "Δ_call": abs(float(crow.get("delta", np.nan))) if "delta" in crow else np.nan,
-                "PoE_call": p_ex_call,
-                "Banda_call": banda_c,
-
-                "Crédito total": credito,
-                "BE_inferior": be_low,
-                "BE_superior": be_high,
-
-                "Lotes máx. cobertos": max_lots,
-                "Score": score
-            })
-
-    dfc = pd.DataFrame(combos)
-    if dfc.empty:
-        return dfc
-
-    dfc = dfc[(dfc["Crédito total"] > 0.0) & (dfc["Lotes máx. cobertos"] > 0)]
-    if dfc.empty:
-        return dfc
-
-    dfc = dfc.sort_values(["Score", "Crédito total"], ascending=[False, False]).head(topn)
-
-    dfc["Crédito (R$)"] = dfc["Crédito total"] * contract_size
-    dfc["Obs. saída"] = dfc.apply(
-        lambda r: (f"Sair se S≈{r['K_put']:.2f} (PUT) ou S≈{r['K_call']:.2f} (CALL), "
-                   f"ou encerrar após capturar ~70–80% do crédito (≈{fmt_money(0.75*r['Crédito (R$)'])})."),
-        axis=1
-    )
-
-    # formatações
-    for col in ["K_put","K_call","Prêmio PUT","Prêmio CALL","Crédito total","BE_inferior","BE_superior"]:
-        dfc[col] = dfc[col].astype(float).round(2)
-    for col in ["Δ_put","Δ_call"]:
-        if col in dfc: dfc[col] = dfc[col].astype(float).round(2)
-    for col in ["PoE_put","PoE_call"]:
-        dfc[col] = dfc[col].astype(float)
-
-    dfc["PoE_put"]  = dfc["PoE_put"].map(fmt_pct)
-    dfc["PoE_call"] = dfc["PoE_call"].map(fmt_pct)
-    dfc["Crédito (R$)"] = dfc["Crédito (R$)"].map(fmt_money)
-
-    return dfc[[
-        "Vencimento",
-        "PUT","K_put","Prêmio PUT","Δ_put","PoE_put","Banda_put",
-        "CALL","K_call","Prêmio CALL","Δ_call","PoE_call","Banda_call",
-        "Crédito total","Crédito (R$)","BE_inferior","BE_superior",
-        "Lotes máx. cobertos","Obs. saída"
-    ]]
-
-# ------------------------
-# Payoff helpers
-# ------------------------
-def payoff_strangle(S, Kp, Kc, credito):
-    # Π = -max(0,Kp-S) - max(0,S-Kc) + credito
-    return -np.maximum(0, Kp - S) - np.maximum(0, S - Kc) + credito
-
-def payoff_iron_condor(S, Kp, Kc, Kp_w, Kc_w, credito_condor):
-    # Strangle + asas (long put em Kp_w, long call em Kc_w)
-    # custo_das_asas embutido no 'credito_condor' (crédito líquido)
-    return (-np.maximum(0, Kp - S) - np.maximum(0, S - Kc)
-            + np.maximum(0, Kp_w - S) + np.maximum(0, S - Kc_w)
-            + credito_condor)
-
-def payoff_jade_lizard(S, Kp, Kc, Kc_w, credito_jl):
-    # PUT vendida + CALL vendida + CALL comprada (Kc_w)
-    # se crédito >= (Kc_w - Kc) => sem risco de alta
-    return (-np.maximum(0, Kp - S) - np.maximum(0, S - Kc)
-            + np.maximum(0, S - Kc_w) + credito_jl)
-
-# ------------------------
-# UI
-# ------------------------
-st.set_page_config(page_title="Strangle Vendido Coberto — v9", page_icon="💼", layout="wide")
-
-st.title("💼 Strangle Vendido Coberto — v9 (colar tabela do opcoes.net)")
-st.caption("Cole a option chain do opcoes.net, escolha o vencimento e veja as sugestões didáticas de strangle coberto e a comparação de estratégias.")
-
-# 1) Ticker básico (apenas “estético”, já que a cadeia virá colada)
-tickers_b3 = ["PETR4", "VALE3", "BBDC4", "ITUB4", "ABEV3", "CSNA3", "MGLU3", "WEGE3"]
-col_tk1, col_tk2, col_spot = st.columns([1,1,1.2])
-with col_tk1:
-    ticker = st.selectbox("🔎 Escolha um ticker da B3", tickers_b3, index=2)
-with col_tk2:
-    st.text_input("Ticker (livre)", value=ticker, key="ticker_free")
-with col_spot:
-    spot = st.number_input("Preço à vista (S)", min_value=0.01, value=17.68, step=0.01, format="%.2f", help="Preço atual do ativo. Você pode editar manualmente se quiser.")
-
-# Sidebar — Parâmetros com help
-st.sidebar.header("⚙️ Parâmetros")
-
-r_anual = st.sidebar.number_input(
-    "Taxa livre de risco anual (r)",
-    min_value=0.0, max_value=1.0, value=0.11, step=0.01, format="%.2f",
-    help="Usada no Black–Scholes. No Brasil, aproxime pela SELIC anualizada. Ex.: 0,11 = 11% a.a."
-)
-
-iv_proxy = st.sidebar.number_input(
-    "HV20 / IV anual (proxy, σ)",
-    min_value=0.0, max_value=3.0, value=0.20, step=0.01, format="%.2f",
-    help="Volatilidade anual de referência. Se a cadeia colada tiver IV por opção, ela será usada por perna; caso contrário, usa-se este valor."
-)
-
-delta_min = st.sidebar.number_input(
-    "|Δ| mínimo", min_value=0.00, max_value=1.00, value=0.05, step=0.01, format="%.2f",
-    help="Filtro de ‘moneyness’ por |Delta|. Vendedores costumam usar ~0,05–0,35 (opções OTM)."
-)
-delta_max = st.sidebar.number_input(
-    "|Δ| máximo", min_value=0.00, max_value=1.00, value=0.35, step=0.01, format="%.2f",
-    help="Limite superior de |Delta| para considerar na sugestão."
-)
-
-risk_bands_help = (
-    "Classificação didática pela probabilidade de exercício (PoE) de cada perna:\n"
-    "• Baixa: 0–15%\n• Média: 15–35%\n• Alta: 35–55%\n"
-    "A sugestão cruza CALL e PUT na mesma banda."
-)
-st.sidebar.text_input("Bandas de risco por perna", value="Baixa / Média / Alta", help=risk_bands_help, disabled=True)
-
-# Cobertura
-st.sidebar.header("🛡️ Cobertura")
-shares_owned = st.sidebar.number_input("Ações em carteira (CALL coberta)", min_value=0, value=1000, step=100,
-                                       help="Quantidade de ações disponíveis para cobrir a CALL.")
-cash_available = st.sidebar.number_input("Caixa disponível (PUT coberta) — R$", min_value=0.0, value=10000.0, step=500.0, format="%.2f",
-                                         help="Valor em caixa para cobrir a PUT no strike (compra de 100 ações por contrato).")
-contract_size = st.sidebar.number_input("Tamanho do contrato", min_value=1, value=100, step=1,
-                                        help="No Brasil, normalmente 100 ações por contrato.")
-
-st.sidebar.header("🚪 Instruções de SAÍDA")
-exit_help = (
-    "Recomprar a perna ameaçada quando o preço encostar no strike perto do vencimento, "
-    "ou encerrar após capturar ~70–80% do prêmio."
-)
-st.sidebar.text_input("Regras práticas", value="Encosta no strike ou 70–80% do prêmio capturado.", help=exit_help, disabled=True)
-
-# 2) Colar a option chain
-st.markdown("### 3) Colar a option chain do **opcoes.net** (Ctrl/Cmd+C no site → Ctrl/Cmd+V aqui)")
-pasted = st.text_area("Cole aqui a tabela", height=260, placeholder="Cole aqui a tabela completa (CALLs e PUTs) do opcoes.net")
-
-if pasted.strip():
-    try:
-        df_all = parse_pasted_table(pasted)
-    except Exception as e:
-        st.error(f"Falha ao interpretar a tabela colada: {e}")
-        st.stop()
-
-    # Verifica colunas essenciais
-    essential = ["symbol","type","strike","last","expiration"]
-    missing = [c for c in essential if c not in df_all.columns]
-    if missing:
-        st.error(f"Colunas essenciais ausentes: {missing}. Verifique se colou a tabela completa.")
-        st.stop()
-
-    # Se não houver impliedVol por opção, usaremos iv_proxy
-    df_all["impliedVol"] = df_all["impliedVol"] if "impliedVol" in df_all.columns else np.nan
-    # delta pode faltar
-    if "delta" not in df_all.columns:
-        df_all["delta"] = np.nan
-
-    # Vencimentos disponíveis
-    vencs = sorted([v for v in df_all["expiration"].dropna().unique()])
-    st.markdown("### 📅 Vencimento")
-    chosen = st.selectbox("Escolha um vencimento", vencs, index=0 if vencs else None)
-
-    # Filtra por vencimento
-    df = df_all[df_all["expiration"] == chosen].copy()
-
-    # Define sigma por perna: se faltou IV individual, usa proxy (iv_proxy)
-    df["sigma"] = df["impliedVol"].fillna(iv_proxy)
-
-    # Tempo até o vencimento (anos)
-    try:
-        T = (pd.to_datetime(chosen) - pd.Timestamp.today()).days / 365.0
-        T = max(T, 1/365)  # evita zero
-    except Exception:
-        T = 30/365
-
-    # Filtros OTM e Δ
-    df["abs_delta"] = df["delta"].abs()
-    # Se delta não existe, não filtrar por delta obrigatoriamente (considera todos) — mas limitará depois pelo OTM.
-    if df["abs_delta"].notna().any():
-        df = df[(df["abs_delta"].isna()) | ((df["abs_delta"] >= delta_min) & (df["abs_delta"] <= delta_max))]
-
-    calls = df[(df["type"] == "C") & (df["strike"] > spot)].copy()
-    puts  = df[(df["type"] == "P") & (df["strike"] < spot)].copy()
-
-    # Top 3
-    st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
-    top3 = select_top3(
-        puts=puts, calls=calls, spot=spot, r=r_anual,
-        sigma=float(iv_proxy),  # para PoE na rankeação; já que σ por opção pode faltar
-        T=T, contract_size=contract_size, shares_owned=shares_owned, cash_available=cash_available
-    )
-
-    if top3.empty:
-        st.warning("Não há strangles cobertos viáveis com os filtros/limites atuais. "
-                   "Ajuste |Δ|, verifique prêmios (‘Último’) e cobertura (ações/caixa).")
+def _label_band(|delta_abs|, bands):
+    """
+    bands: dict com faixas em % ITM aproximado pelo |Δ| (0–1).
+    Retorna rótulo "Baixo/Médio/Alto" conforme limites.
+    """
+    if pd.isna(|delta_abs|):
+        return "—"
+    p = |delta_abs| * 100.0
+    low_hi  = bands["Baixo"][1]    # fim da faixa baixa
+    mid_hi  = bands["Médio"][1]    # fim da faixa média
+    if p <= low_hi:
+        return "Baixo"
+    elif p <= mid_hi:
+        return "Médio"
     else:
-        st.dataframe(top3, use_container_width=True, hide_index=True)
-        for i, row in top3.iterrows():
+        return "Alto"
+
+def _format_money(v):
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
+
+# ============== HEADER (estilo anterior) ==============
+st.title("💼 Strangle Vendido Coberto — v9 (colar tabela do opcoes.net)")
+st.write("Cole a option chain do **opcoes.net**, escolha o vencimento e veja as **sugestões didáticas** de strangle coberto e a **comparação de estratégias**.")
+
+colA, colB, colC = st.columns([1.1,1,1])
+with colA:
+    st.markdown("#### 🔎 Escolha um ticker da B3")
+    ticker = st.text_input("Ticker (livre)", value="PETR4")
+with colB:
+    spot = st.text_input("Preço à vista (S)", value="17,68")
+    spot = _br_to_float(spot)
+with colC:
+    hv20 = st.text_input("HV20 (σ anual – proxy)", value="17,12%")
+    r_anual = st.text_input("r (anual)", value="11,00%")
+
+# ============== SIDEBAR (com tooltips operantes) ==============
+st.sidebar.header("⚙️ Parâmetros (explicativos)")
+mindelta = st.sidebar.number_input(
+    "|Δ| mínimo",
+    min_value=0.00, max_value=1.00, step=0.01, value=0.05,
+    help="Filtro de moneyness por |Δ| (aprox. PoE ITM). Ex.: 0,05 = 5%."
+)
+maxdelta = st.sidebar.number_input(
+    "|Δ| máximo",
+    min_value=0.00, max_value=1.00, step=0.01, value=0.35,
+    help="Filtro superior de |Δ|. Vendedores usam ~0,05–0,35."
+)
+
+st.sidebar.markdown("##### Bandas de risco por perna")
+b_baixo = st.sidebar.slider(
+    "Faixa Baixo (0–X%)",
+    min_value=0, max_value=55, value=15,
+    help="Prob. ITM ≈ |Δ| × 100. Até aqui rotulamos a perna como **Baixo**."
+)
+b_medio = st.sidebar.slider(
+    "Faixa Médio (X–Y%)",
+    min_value=b_baixo, max_value=55, value=35,
+    help="Até este limite, rotulamos a perna como **Médio**. Acima disso é **Alto**."
+)
+bands_cfg = {
+    "Baixo": (0, b_baixo),
+    "Médio": (b_baixo, b_medio),
+    "Alto":  (b_medio, 55)
+}
+
+st.sidebar.markdown("##### Instruções de SAÍDA — Regras práticas")
+dte_alert = st.sidebar.number_input(
+    "Dias até vencimento (alerta)",
+    min_value=0, max_value=60, value=7,
+    help="Quando faltarem ≤ N dias, as mensagens de saída ficam mais proativas."
+)
+prox_pct = st.sidebar.number_input(
+    "Proximidade ao strike (%)",
+    min_value=0.0, max_value=20.0, value=1.0, step=0.1,
+    help="Considera o strike 'ameaçado' quando S está a menos de X% dele."
+)
+take_profit = st.sidebar.number_input(
+    "Meta de captura do prêmio (%)",
+    min_value=10, max_value=95, value=75, step=5,
+    help="Ex.: 70–80% do crédito já capturado ⇒ encerra (zera o risco)."
+)
+
+contract_size = st.sidebar.number_input(
+    "Tamanho do contrato",
+    min_value=1, max_value=1000, value=100,
+    help="Normalmente 100 ações por contrato."
+)
+qty_shares = st.sidebar.number_input(
+    f"Ações em carteira ({ticker})",
+    min_value=0, max_value=1_000_000, value=0,
+    help="Para cobrir a CALL vendida (covered call)."
+)
+cash_avail = st.sidebar.text_input(
+    f"Caixa disponível (R$) ({ticker})",
+    value="10.000,00",
+    help="Para cobrir a PUT vendida (cash-secured)."
+)
+cash_avail = _br_to_float(cash_avail)
+
+# ============== COLAR OPTION CHAIN ==============
+st.markdown("### 3) Colar a option chain do **opcoes.net** (CTRL/CMD+V)")
+raw = st.text_area("Cole aqui a tabela (copie do site e cole aqui)", height=240, key="pastebox")
+
+df = None
+if raw.strip():
+    sep = _guess_sep_from_text(raw)
+    try:
+        if sep == "\t":
+            df_raw = pd.read_csv(StringIO(raw), sep="\t")
+        else:
+            df_raw = pd.read_csv(StringIO(re.sub(r"[ ]{2,}", "\t", raw)), sep="\t")
+    except Exception:
+        # fallback simples: uma coluna só -> tentar por linhas e split
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        rows = [re.split(r"\t|[ ]{2,}", ln.strip()) for ln in lines]
+        df_raw = pd.DataFrame(rows[1:], columns=rows[0])
+
+    # limpar
+    df = _clean_dataframe(df_raw)
+
+if df is not None and not df.empty:
+    # lista de vencimentos
+    exps = sorted(df["expiration"].dropna().unique().tolist())
+    st.markdown("### 📅 Vencimento")
+    chosen_exp = st.selectbox("Escolha um vencimento:", options=exps)
+
+    # filtra por vencimento escolhido
+    df_exp = df[df["expiration"] == chosen_exp].copy()
+
+    # mostrar resumo leve (sem poluição)
+    with st.expander("Ver prévia da cadeia (limpa)", expanded=False):
+        st.dataframe(df_exp[["symbol","type","strike","last","impliedVol","delta","expiration"]], height=260, use_container_width=True)
+
+    # pairing
+    combos = _pair_strangles(df_exp, spot, mindelta, maxdelta)
+
+    if not combos:
+        st.warning("Não há CALL e PUT OTM suficientes com os filtros atuais. Ajuste |Δ| ou escolha outro vencimento.")
+    else:
+        dfc = pd.DataFrame(combos)
+
+        # bandas por perna (usando |Δ|)
+        def band_label(x):
+            return "—" if pd.isna(x) else ("Baixo" if x*100 <= b_baixo else ("Médio" if x*100 <= b_medio else "Alto"))
+
+        dfc["Banda_put"]  = dfc["Δ_put"].map(band_label)
+        dfc["Banda_call"] = dfc["Δ_call"].map(band_label)
+
+        # cobertura: CALL coberta por ações, PUT por caixa
+        # lotes máximos
+        max_lotes_call = qty_shares // contract_size if contract_size>0 else 0
+        # risco put: alocação nominal ≈ K_put * contrato
+        dfc["Aloc. PUT (R$) por lote"] = dfc["K_put"] * contract_size
+        dfc["Lotes PUT cash-secured"]   = np.floor(cash_avail / dfc["Aloc. PUT (R$) por lote"]).astype(int)
+        dfc["Lotes CALL cobertos"]      = max_lotes_call
+        dfc["Lotes máx. cobertos"]      = dfc[["Lotes PUT cash-secured","Lotes CALL cobertos"]].min(axis=1)
+
+        # rank simples: maior crédito / (distância relativa das asas até S)
+        dist_rel = ((dfc["K_call"] - spot).abs() + (spot - dfc["K_put"]).abs())/max(spot,1e-6)
+        dfc["score"] = dfc["Crédito num"] / (dist_rel.replace(0, np.nan))
+        dfc = dfc.sort_values(["Lotes máx. cobertos","score","Crédito num"], ascending=[False, False, False])
+
+        # dica de saída (usa proximidade e DTE)
+        # dias até venc = diferença real
+        try:
+            d_exp = date.fromisoformat(chosen_exp)
+            dte = (d_exp - date.today()).days
+        except:
+            dte = None
+
+        def saida_row(rw):
+            kput, kcall = rw["K_put"], rw["K_call"]
+            alerta_time = (dte is not None and dte <= dte_alert)
+            prox_kput  = abs((spot - kput)/kput)*100 <= prox_pct
+            prox_kcall = abs((spot - kcall)/kcall)*100 <= prox_pct
+            dicas = []
+            if alerta_time:
+                dicas.append(f"⏳ faltam ≤ {dte_alert} dias")
+            if prox_kput:
+                dicas.append("S encostando no **K_put** ⇒ recomprar a PUT")
+            if prox_kcall:
+                dicas.append("S encostando no **K_call** ⇒ recomprar a CALL")
+            dicas.append(f"🎯 capturar ~{take_profit}% do crédito e encerrar")
+            return " | ".join(dicas)
+
+        dfc["Obs. saída"] = dfc.apply(saida_row, axis=1)
+        dfc["Crédito total"] = dfc["Crédito num"]  # por ação; por lote multiplicar por contract_size
+
+        # TOP 3
+        top3 = dfc[dfc["Lotes máx. cobertos"]>0].head(3).copy()
+        if top3.empty:
+            top3 = dfc.head(3).copy()  # se não houver cobertura, mostra mesmo assim
+
+        st.markdown("### 🏆 Top 3 (melhor prêmio/risco)")
+        # Imprime no estilo “anterior”, com linhas simples e fortes, sem cards
+        for i, rw in top3.reset_index(drop=True).iterrows():
+            credito_lote = rw["Crédito num"] * contract_size
             st.markdown(
-                f"**#{i+1}** → Vender **PUT {row['PUT']} (K={row['K_put']:.2f})** + "
-                f"**CALL {row['CALL']} (K={row['K_call']:.2f})** | "
-                f"Crédito por lote: **{row['Crédito (R$)']}** | "
-                f"Break-evens: **[{row['BE_inferior']:.2f}, {row['BE_superior']:.2f}]** | "
-                f"PoE PUT: **{row['PoE_put']}**, PoE CALL: **{row['PoE_call']}** | "
-                f"Lotes cobertos: **{int(row['Lotes máx. cobertos'])}**  \n"
-                f"_Dica_: {row['Obs. saída']}"
+                f"**#{i+1} →** Vender **PUT {rw['PUT']} (K={rw['K_put']:.2f})** + "
+                f"**CALL {rw['CALL']} (K={rw['K_call']:.2f})** "
+                f"| **Crédito por lote:** **{_format_money(credito_lote)}** "
+                f"| **Break-evens:** **[{rw['BE_inferior']:.2f}, {rw['BE_superior']:.2f}]** "
+                f"| **PoE PUT:** {rw['PoE_put']} • **PoE CALL:** {rw['PoE_call']} "
+                f"| **Bandas:** PUT **{rw['Banda_put']}** • CALL **{rw['Banda_call']}**\n"
+                f"**Dica:** {rw['Obs. saída']}"
             )
 
-        # 4) Visualizações e comparação
-        st.markdown("---")
-        st.markdown("### 📈 Payoff no Vencimento (P/L por ação) + Comparar estratégias")
+        with st.expander("📋 Tabela completa (esta sessão)"):
+            show = dfc.copy()
+            show["Crédito por lote"] = show["Crédito num"] * contract_size
+            cols = [
+                "PUT","K_put","Δ_put","Banda_put","CALL","K_call","Δ_call","Banda_call",
+                "Crédito (R$)","Crédito por lote","BE_inferior","BE_superior",
+                "Lotes PUT cash-secured","Lotes CALL cobertos","Lotes máx. cobertos","Obs. saída"
+            ]
+            st.dataframe(show[cols], use_container_width=True, height=360)
 
-        tabs = st.tabs(["📈 Payoff Strangle", "🔀 Comparar estratégias", "📘 Explicações & Fórmulas"])
+        # ========== Comparar estratégias (resumo didático) ==========
+        st.markdown("### 📈 Comparar estratégias (Strangle × Iron Condor × Jade Lizard)")
+        # base = melhor do top3
+        base = top3.iloc[0] if not top3.empty else dfc.iloc[0]
+        Kp, Kc = base["K_put"], base["K_call"]
+        credito = base["Crédito num"]
+        asas_pct = st.slider("Largura das asas (% do preço à vista)", 2, 15, 8)
+        asa_abs = (asas_pct/100.0)*spot
+        Kp_w = max(0.01, Kp - asa_abs) # compra da PUT
+        Kc_w = Kc + asa_abs            # compra da CALL
 
-        # Base: usa a #1 do Top 3
-        base = top3.iloc[0]
-        Kp_base = float(base["K_put"])
-        Kc_base = float(base["K_call"])
-        credito_base = float(base["Crédito total"])
+        # iron condor (aprox): perda máx por lado = (distância asa) - crédito
+        perda_max_aprox = max((Kp - Kp_w), (Kc_w - Kc)) - credito
+        perda_max_aprox = max(perda_max_aprox, 0)
 
-        S_min = max(0.01, spot * 0.7)
-        S_max = spot * 1.3
-        S_grid = np.linspace(S_min, S_max, 301)
+        # jade lizard: sem risco de alta se crédito >= (Kc_w - Kc)
+        sem_risco_alta = credito >= (Kc_w - Kc)
 
-        with tabs[0]:
-            pl = payoff_strangle(S_grid, Kp_base, Kc_base, credito_base)
-            fig = plt.figure()
-            plt.axhline(0, linewidth=1)
-            plt.axvline(Kp_base, linestyle="--", linewidth=1)
-            plt.axvline(Kc_base, linestyle="--", linewidth=1)
-            plt.plot(S_grid, pl, linewidth=2)
-            plt.title(f"Strangle: Kp={Kp_base:.2f}, Kc={Kc_base:.2f} | crédito≈{credito_base:.2f}/ação")
-            plt.xlabel("Preço no vencimento (S_T)")
-            plt.ylabel("P/L por ação")
-            st.pyplot(fig, clear_figure=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Strangle — Crédito", _format_money(credito))
+            st.text(f"Zona neutra (Kp–Kc): {Kp:.2f} — {Kc:.2f}")
+        with c2:
+            st.metric("Iron Condor — Crédito", _format_money(credito*0.95))
+            st.text(f"Asas (P,C): {Kp_w:.2f}, {Kc_w:.2f}")
+            st.text(f"Perda máx. aprox.: {_format_money(perda_max_aprox)}")
+        with c3:
+            st.metric("Jade Lizard — Crédito", _format_money(credito*0.95))
+            st.text(f"Asa (CALL): {Kc_w:.2f}")
+            st.text(f"Sem risco de alta? {'Sim' if sem_risco_alta else 'Não'}")
 
-        with tabs[1]:
-            st.subheader("Strangle × Iron Condor × Jade Lizard")
-            colA, colB, colC = st.columns(3)
-            with colA:
-                st.markdown(f"**Strangle base**: {Kp_base:.2f}–{Kc_base:.2f} | crédito≈{credito_base:.2f}")
-            with colB:
-                # define asas % do preço atual (simples)
-                wing_pct = st.slider("Largura das asas (% do preço à vista)", 2, 20, 10, 1)
-            with colC:
-                st.write("")
-
-            # Iron Condor: compra PUT abaixo e CALL acima
-            Kp_w = max(0.01, Kp_base - (wing_pct/100.0)*spot)
-            Kc_w = Kc_base + (wing_pct/100.0)*spot
-            # custo das asas não conhecido; assuma pequeno e gere um crédito líquido próximo do strangle:
-            credito_condor = max(0.0, credito_base - 0.02*spot)  # ajuste simples
-
-            # Jade Lizard: PUT vendida (Kp), CALL vendida (Kc), CALL comprada (Kc_w)
-            credito_jl = credito_base * 0.95  # suposição simples
-            jl_no_risco_alta = credito_jl >= (Kc_w - Kc_base)
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Strangle — Crédito", fmt_money(credito_base * contract_size))
-                st.write(f"Zona neutra (Kp–Kc): **{Kp_base:.2f} — {Kc_base:.2f}**")
-            with col2:
-                st.metric("Iron Condor — Crédito", fmt_money(credito_condor * contract_size))
-                st.write(f"Asas (P,C): **{Kp_w:.2f}**, **{Kc_w:.2f}**")
-            with col3:
-                st.metric("Jade Lizard — Crédito", fmt_money(credito_jl * contract_size))
-                st.write(f"Asa (CALL): **{Kc_w:.2f}** — Sem risco de alta? **{'Sim' if jl_no_risco_alta else 'Não'}**")
-
-            # Gráficos
-            pl_s = payoff_strangle(S_grid, Kp_base, Kc_base, credito_base)
-            pl_c = payoff_iron_condor(S_grid, Kp_base, Kc_base, Kp_w, Kc_w, credito_condor)
-            pl_j = payoff_jade_lizard(S_grid, Kp_base, Kc_base, Kc_w, credito_jl)
-
-            fig2 = plt.figure()
-            plt.axhline(0, linewidth=1)
-            plt.plot(S_grid, pl_s, linewidth=2, label="Strangle")
-            plt.plot(S_grid, pl_c, linewidth=2, label="Iron Condor")
-            plt.plot(S_grid, pl_j, linewidth=2, label="Jade Lizard")
-            plt.legend()
-            plt.title("Comparação de Payoffs (por ação)")
-            plt.xlabel("Preço no vencimento (S_T)")
-            plt.ylabel("P/L por ação")
-            st.pyplot(fig2, clear_figure=True)
-
-        with tabs[2]:
-            st.markdown("#### 📘 Explicações rápidas")
-            st.markdown(
-                f"""
-- **Strangle**: vender PUT (Kp={Kp_base:.2f}) + CALL (Kc={Kc_base:.2f}).  
-  **Lucro máx.** ≈ crédito. **Break-evens**: {Kp_base-credito_base:.2f} e {Kc_base+credito_base:.2f}.  
-  **Perigo**: encostar Kp (queda) ou Kc (alta).
-
-- **Iron Condor**: Strangle + compra de uma PUT mais baixa (Kp_w={Kp_w:.2f}) e uma CALL mais alta (Kc_w={Kc_w:.2f}).  
-  **Objetivo**: limitar perda máxima.
-
-- **Jade Lizard**: PUT vendida + CALL vendida + CALL comprada em Kc_w={Kc_w:.2f}.  
-  Se **crédito ≥ (Kc_w − Kc)** ⇒ **sem risco de alta**.  
-  Aqui: crédito≈{credito_jl:.2f} {'≥' if jl_no_risco_alta else '<'} {(Kc_w-Kc_base):.2f} ⇒ **{'Sim' if jl_no_risco_alta else 'Não'}**.
-
-- **Saída** (geral): recomprar a perna ameaçada quando S encostar no strike perto do vencimento,  
-  ou encerrar após capturar ~70–80% do prêmio.
-                """
-            )
-
+        st.markdown("#### 📘 Explicações e fórmulas")
+        st.markdown(
+            f"- **Strangle**: vender PUT (Kp={Kp:.2f}) + CALL (Kc={Kc:.2f}). Lucro = crédito se **S** ficar entre os strikes.\n"
+            f"- **Iron Condor**: Strangle + compra das asas (Kp_w={Kp_w:.2f}, Kc_w={Kc_w:.2f}) → limita a perda máxima.\n"
+            f"- **Jade Lizard**: PUT vendida + CALL vendida + CALL comprada (Kc_w). Se **crédito ≥ (Kc_w − Kc)**, não há risco na alta.\n\n"
+            "P/L por ação (vencimento):\n"
+            "- Strangle: Π(S) = −max(0, Kp − S) − max(0, S − Kc) + crédito.\n"
+            "- Iron Condor = Strangle + max(0, Kp_w − S) + max(0, S − Kc_w) − custo_das_asas.\n"
+            "- Jade Lizard = −max(0, Kp − S) − max(0, S − Kc) + max(0, S − Kc_w) + crédito_líquido."
+        )
 else:
-    st.info("Cole a tabela do **opcoes.net** acima (todas as linhas das CALLs e PUTs). Em seguida, escolha o vencimento.")
+    st.info("Cole a **tabela completa** do opcoes.net acima para começar. Dica: clique na tabela no site, **CTRL/CMD+C** e depois **CTRL/CMD+V** aqui.")
