@@ -2,10 +2,10 @@
 # ------------------------------------------------------------
 # Strangle Vendido Coberto — v9
 # - Lista de tickers da B3 (dadosdemercado.com.br) com busca por nome/código
-# - Preço à vista (S) sempre via yfinance
+# - Preço via yfinance (rotulado como "Strike" conforme pedido)
 # - HV20 (proxy) e r (anual) no menu lateral
 # - Colar a option chain (opcoes.net) e selecionar vencimento
-# - Sugestões (Top 3): tabela + cartões didáticos com "Strike="
+# - Sugestões (Top 3): tabela + cartões didáticos (Break-evens bonitos)
 # - Cálculos: crédito/ação, break-evens, PoE (Black–Scholes), prêmio total por lotes
 # ------------------------------------------------------------
 
@@ -40,7 +40,6 @@ def br_to_float(s: str):
     s = str(s).strip()
     if s == "":
         return np.nan
-    # remove separador de milhar . e troca vírgula por ponto
     s = s.replace(".", "").replace(",", ".")
     try:
         return float(s)
@@ -60,7 +59,6 @@ def parse_date_br(d: str):
     try:
         return datetime.strptime(d, "%d/%m/%Y").date()
     except Exception:
-        # Já ISO?
         try:
             return datetime.strptime(d, "%Y-%m-%d").date()
         except Exception:
@@ -72,7 +70,6 @@ def format_brl(x: float):
     return f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def yahoo_symbol_from_b3(ticker_b3: str):
-    """Monta o ticker do Yahoo Finance ('.SA') a partir do ticker B3 (ex: BBDC4 -> BBDC4.SA)."""
     t = (ticker_b3 or "").strip().upper()
     if not t.endswith(".SA"):
         t = t + ".SA"
@@ -83,7 +80,6 @@ def yahoo_symbol_from_b3(ticker_b3: str):
 # -------------------------
 SQRT_2 = math.sqrt(2.0)
 def norm_cdf(x):
-    # usar math.erf para evitar erro de atributo do numpy
     return 0.5 * (1.0 + math.erf(x / SQRT_2))
 
 def d1_d2(S, K, r, sigma, T):
@@ -97,12 +93,10 @@ def d1_d2(S, K, r, sigma, T):
         return (np.nan, np.nan)
 
 def prob_ITM_call(S, K, r, sigma, T):
-    # P(S_T > K) ~ N(d2)
     _, d2 = d1_d2(S, K, r, sigma, T)
     return norm_cdf(d2) if not np.isnan(d2) else np.nan
 
 def prob_ITM_put(S, K, r, sigma, T):
-    # P(S_T < K) = 1 - P(S_T > K) = N(-d2)
     _, d2 = d1_d2(S, K, r, sigma, T)
     return norm_cdf(-d2) if not np.isnan(d2) else np.nan
 
@@ -115,11 +109,8 @@ def fetch_b3_tickers():
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    # A página tem uma tabela com tickers e nomes; vamos ler via pandas.read_html também
-    # Fallback: usar read_html direto
     try:
         dfs = pd.read_html(r.text)
-        # procurar tabela com colunas contendo 'Código' e 'Empresa'
         best = None
         for df in dfs:
             cols = [c.lower() for c in df.columns.astype(str)]
@@ -127,11 +118,8 @@ def fetch_b3_tickers():
                 best = df
                 break
         if best is None:
-            # heurística: primeira com >= 2 colunas
             best = dfs[0]
-        # padronizar
         best.columns = [str(c).strip() for c in best.columns]
-        # detectar colunas
         code_col = None
         name_col = None
         for c in best.columns:
@@ -148,13 +136,10 @@ def fetch_b3_tickers():
         out.columns = ["ticker", "empresa"]
         out["ticker"] = out["ticker"].astype(str).str.strip().str.upper()
         out["empresa"] = out["empresa"].astype(str).str.strip()
-        # filtrar tickers de ações (heurística simples: tem número no fim ou 3-5 letras)
         out = out[out["ticker"].str.match(r"^[A-Z]{3,5}\d{0,2}$")]
-        # remover duplicatas
         out = out.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
         return out
     except Exception:
-        # fallback vazio
         return pd.DataFrame(columns=["ticker", "empresa"])
 
 # -------------------------
@@ -164,7 +149,6 @@ def fetch_b3_tickers():
 def fetch_yf_price_and_hv20(y_ticker: str):
     try:
         info = yf.Ticker(y_ticker)
-        # preço atual (último close) + histórico para HV20
         hist = info.history(period="60d", interval="1d")
         price = np.nan
         if not hist.empty:
@@ -172,7 +156,6 @@ def fetch_yf_price_and_hv20(y_ticker: str):
                 price = float(hist["Close"].iloc[-1])
             elif "Adj Close" in hist.columns:
                 price = float(hist["Adj Close"].iloc[-1])
-        # HV20 anualizado
         hv20 = np.nan
         if len(hist) >= 21:
             ret = hist["Close"].pct_change().dropna()
@@ -187,41 +170,24 @@ def fetch_yf_price_and_hv20(y_ticker: str):
 # Parsing da option chain colada
 # -------------------------
 def parse_pasted_chain(text: str):
-    """
-    Esperado: colagem da tabela do opcoes.net (pt-BR).
-    Colunas importantes (nomes aproximados):
-      - Ticker
-      - Vencimento (dd/mm/aaaa)
-      - Tipo (CALL/PUT)
-      - Strike
-      - Último
-      - Vol. Impl. (%) (opcional)
-      - Delta (opcional)
-    """
     if not text or text.strip() == "":
         return pd.DataFrame()
 
-    # Normalizar tabs e múltiplos espaços em ';'
-    # Melhor: tentar CSV por delimitador de tab/whitespace
     raw = text.strip()
-    # pandas detecta automaticamente se for separado por \t; como fallback, substituir múltiplos espaços por tab
     if "\t" not in raw:
         raw = re.sub(r"[ ]{2,}", "\t", raw)
 
     try:
         df = pd.read_csv(io.StringIO(raw), sep="\t", engine="python")
     except Exception:
-        # fallback por ; pois alguns copiadores usam ponto e vírgula
         try:
             df = pd.read_csv(io.StringIO(raw), sep=";", engine="python")
         except Exception:
             return pd.DataFrame()
 
-    # Padronizar nomes de colunas
     cols = {c: c.strip() for c in df.columns}
     df.rename(columns=cols, inplace=True)
 
-    # Descobrir colunas
     def find_col(cands):
         for c in df.columns:
             lc = c.lower()
@@ -239,7 +205,6 @@ def parse_pasted_chain(text: str):
     col_delta = find_col(["delta"])
 
     if not all([col_ticker, col_venc, col_tipo, col_strike, col_ultimo]):
-        # colunas mínimas não presentes
         return pd.DataFrame()
 
     out = pd.DataFrame()
@@ -248,18 +213,9 @@ def parse_pasted_chain(text: str):
     out["strike"] = df[col_strike].apply(br_to_float)
     out["last"]   = df[col_ultimo].apply(br_to_float)
     out["expiration"] = df[col_venc].apply(parse_date_br)
+    out["impliedVol"] = df[col_iv].apply(pct_to_float) if col_iv else np.nan
+    out["delta"] = df[col_delta].apply(br_to_float) if col_delta else np.nan
 
-    if col_iv:
-        out["impliedVol"] = df[col_iv].apply(pct_to_float)  # fração
-    else:
-        out["impliedVol"] = np.nan
-
-    if col_delta:
-        out["delta"] = df[col_delta].apply(br_to_float)
-    else:
-        out["delta"] = np.nan
-
-    # limpar linhas inválidas
     out = out[pd.notna(out["strike"]) & pd.notna(out["expiration"])].copy()
     return out.reset_index(drop=True)
 
@@ -268,7 +224,6 @@ def business_days_between(d1: date, d2: date):
         return np.nan
     if d2 < d1:
         return 0
-    # aproximação: contar dias úteis por np.busday_count
     try:
         return np.busday_count(d1, d2)
     except Exception:
@@ -285,8 +240,8 @@ with st.container():
     st.subheader("🔎 Escolha um ticker da B3 (pesquise por nome ou código)")
     tickers_df = fetch_b3_tickers()
     if tickers_df.empty:
-        st.warning("Não consegui carregar a lista de tickers agora. Você ainda pode digitar o código manualmente.")
-        user_ticker = st.text_input("Ticker (livre)", value="PETR4")
+        st.warning("Não consegui carregar a lista de tickers agora. Digite o código manualmente no campo abaixo.")
+        user_ticker = st.text_input("Ticker da B3", value="PETR4")
     else:
         tickers_df["label"] = tickers_df["ticker"] + " — " + tickers_df["empresa"]
         default_idx = int((tickers_df["ticker"] == "PETR4").idxmax()) if "PETR4" in set(tickers_df["ticker"]) else 0
@@ -296,19 +251,16 @@ with st.container():
             index=default_idx if default_idx is not None else 0,
             help="Digite para pesquisar por nome ou código."
         )
-        # extrair o ticker
         sel_row = tickers_df.loc[tickers_df["label"] == sel_label].iloc[0]
         user_ticker = sel_row["ticker"]
 
-# 2) Preço via yfinance
+# 2) Preço via yfinance (rótulo pedido: 'Strike')
 y_ticker = yahoo_symbol_from_b3(user_ticker)
 spot, hv20_auto = fetch_yf_price_and_hv20(y_ticker)
 
-colA, colB = st.columns([1,1], vertical_alignment="center")
+colA = st.columns([1])[0]
 with colA:
-    st.text_input("Ticker (livre)", value=user_ticker, key="ticker_display", disabled=True)
-with colB:
-    st.number_input("Preço à vista (S)", value=float(spot) if pd.notna(spot) else 0.0, step=0.01, format="%.2f", disabled=True)
+    st.number_input("Strike", value=float(spot) if pd.notna(spot) else 0.0, step=0.01, format="%.2f", disabled=True)
 
 # 3) Sidebar: parâmetros (HV20, r) e cobertura
 st.sidebar.header("⚙️ Parâmetros & Cobertura")
@@ -375,8 +327,9 @@ if calls.empty or puts.empty:
     st.warning("Não encontrei CALL e PUT OTM simultaneamente nesse vencimento. Experimente outro vencimento.")
     st.stop()
 
-# para cada combinação PUT x CALL calcular crédito, BE e PoE
+# PoE (probabilidade de exercício)
 r = r_input / 100.0
+
 def poe_side(row, side):
     K = float(row["strike"])
     sig = float(row["sigma"]) if pd.notna(row["sigma"]) and row["sigma"] > 0 else sigma_proxy
@@ -385,8 +338,7 @@ def poe_side(row, side):
 puts["poe"]  = puts.apply(lambda rw: poe_side(rw, "P"), axis=1)
 calls["poe"] = calls.apply(lambda rw: poe_side(rw, "C"), axis=1)
 
-# montar grid de pares (cartesiano leve) com heurística: combinar puts/calls próximos em "alas" (não explodir)
-# Vamos limitar a, no máx, 30 melhores por lado por preço para deixar rápido
+# Combinações PUT x CALL (limitadas para velocidade)
 puts_small  = puts.sort_values(["price"], ascending=False).head(30).copy()
 calls_small = calls.sort_values(["price"], ascending=False).head(30).copy()
 
@@ -395,14 +347,12 @@ for _, prow in puts_small.iterrows():
     for _, crow in calls_small.iterrows():
         kp = float(prow["strike"]); kc = float(crow["strike"])
         if not (kp < S < kc):
-            # strangle deve ser OTM dos dois lados
             continue
         cred = float(prow["price"]) + float(crow["price"])
         be_low  = kp - cred
         be_high = kc + cred
         poe_p = float(prow["poe"]) if pd.notna(prow["poe"]) else np.nan
         poe_c = float(crow["poe"]) if pd.notna(crow["poe"]) else np.nan
-        # score: crédito penalizado pela probabilidade média de exercício
         risk_penalty = 1.0 - np.nanmean([poe_p, poe_c]) if not np.isnan(np.nanmean([poe_p, poe_c])) else 1.0
         score = cred * max(risk_penalty, 0.0)
         pairs.append({
@@ -426,23 +376,23 @@ pairs_df["score"] = pairs_df["credito"] * (1.0 - ((pairs_df["poe_put"].fillna(0)
 pairs_df = pairs_df.sort_values(["score","credito"], ascending=[False, False]).reset_index(drop=True)
 
 top3 = pairs_df.head(3).copy()
+
+# --- Tabela Top 3 (Break-evens bonitos) ---
 top3_display = top3.copy()
 top3_display["Crédito/ação (R$)"] = top3_display["credito"].map(lambda x: f"{x:.2f}")
-top3_display["Break-evens"] = top3_display.apply(lambda r: f"[{r['be_low']:.2f}, {r['be_high']:.2f}]", axis=1)
+top3_display["Break-evens (mín–máx)"] = top3_display.apply(lambda r: f"{r['be_low']:.2f} — {r['be_high']:.2f}", axis=1)
 top3_display["Prob. exercício PUT (%)"]  = (100*top3_display["poe_put"]).map(lambda x: f"{x:.1f}")
 top3_display["Prob. exercício CALL (%)"] = (100*top3_display["poe_call"]).map(lambda x: f"{x:.1f}")
-top3_display = top3_display[["PUT","Kp","CALL","Kc","Crédito/ação (R$)","Break-evens","Prob. exercício PUT (%)","Prob. exercício CALL (%)"]]
+top3_display = top3_display[["PUT","Kp","CALL","Kc","Crédito/ação (R$)","Break-evens (mín–máx)","Prob. exercício PUT (%)","Prob. exercício CALL (%)"]]
 top3_display.rename(columns={"Kp":"Strike PUT","Kc":"Strike CALL"}, inplace=True)
 
-# 7) Tabela Top 3
 st.subheader("🏆 Top 3 (melhor prêmio/risco)")
 st.dataframe(top3_display, use_container_width=True, hide_index=True)
 
-# 8) Cartões detalhados com cálculo de prêmio e explicações (Strike=..., PoE claro)
+# 8) Cartões detalhados
 st.markdown("—")
 st.subheader("📋 Recomendações detalhadas")
 
-# Preparar estado para lotes
 if "lot_map" not in st.session_state:
     st.session_state["lot_map"] = {}
 for idx in top3.index:
@@ -455,7 +405,7 @@ for i, rw in top3.iterrows():
     lots = st.number_input(f"#{rank} — Lotes (1 lote = 1 PUT + 1 CALL)", min_value=0, max_value=10000, value=st.session_state["lot_map"][i], key=key_lotes)
     st.session_state["lot_map"][i] = lots
 
-    premio_total = rw["credito"] * contract_size * lots
+    premio_total = rw["credito"] * CONTRACT_SIZE * lots
 
     with st.container(border=True):
         st.markdown(
@@ -463,14 +413,15 @@ for i, rw in top3.iterrows():
         )
         c1, c2, c3 = st.columns([1.0, 1.2, 1.2])
         c1.metric("Crédito/ação", format_brl(rw["credito"]))
-        c2.metric("Break-evens", f"[{rw['be_low']:.2f}, {rw['be_high']:.2f}]")
+        # Break-evens com rótulo limpo
+        c2.metric("Break-evens (mín–máx)", f"{rw['be_low']:.2f} — {rw['be_high']:.2f}")
         c3.metric("Prob. exercício (PUT / CALL)", f"{100*rw['poe_put']:.1f}% / {100*rw['poe_call']:.1f}%")
 
         d1, d2 = st.columns([1.1, 2.0])
         d1.metric("🎯 Prêmio estimado (total)", format_brl(premio_total))
         d2.markdown(
             f"**Cálculo:** `crédito/ação × contrato × lotes` = "
-            f"`{rw['credito']:.2f} × {contract_size} × {lots}` → **{format_brl(premio_total)}**"
+            f"`{rw['credito']:.2f} × {CONTRACT_SIZE} × {lots}` → **{format_brl(premio_total)}**"
         )
 
         with st.expander("📘 O que significa cada item?"):
@@ -480,16 +431,16 @@ for i, rw in top3.iterrows():
 Soma dos prêmios recebidos ao vender **1 PUT** e **1 CALL** (por **ação**).  
 *Exemplo:* se PUT paga R$ 0,08 e CALL paga R$ 0,06, o total é **R$ 0,14 por ação**.
 
-**Break-evens**  
+**Break-evens (mín–máx)**  
 Faixa de preço no vencimento onde o resultado ainda é ≥ 0.  
-*Exemplo:* **[{rw['be_low']:.2f}, {rw['be_high']:.2f}]**.
+*Exemplo desta sugestão:* **{rw['be_low']:.2f} — {rw['be_high']:.2f}**.
 
 **Probabilidade de exercício (PUT / CALL)**  
-Chance estimada (Black–Scholes) de a opção terminar **dentro do dinheiro**.  
-*Exemplo:* **PUT {100*rw['poe_put']:.1f}%** significa {100*rw['poe_put']:.1f}% de chance de S < Strike da PUT no vencimento.
+Chance estimada (Black–Scholes) de a opção terminar **dentro do dinheiro** no vencimento.  
+*Exemplo:* **PUT {100*rw['poe_put']:.1f}%** significa {100*rw['poe_put']:.1f}% de chance de S < Strike da PUT.
 
 **Lotes e prêmio total**  
-Cada **lote** = vender **1 PUT + 1 CALL** (contrato = {contract_size} ações).  
+Cada **lote** = vender **1 PUT + 1 CALL** (contrato = {CONTRACT_SIZE} ações).  
 Prêmio total = **crédito/ação × contrato × lotes**.
 
 **Regras práticas de saída**  
